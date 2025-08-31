@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+"""
+K9 Behavior Tree Node
+---------------------
+
+This file defines the main behavior tree (BT) that drives K9's
+speech interaction and eye panel control.
+
+It uses py_trees and py_trees_ros to:
+- Wait for a hotword
+- Start listening (speech-to-text)
+- Wait for a command
+- Send the command to an LLM service
+- Speak the response via TTS
+- Resume listening
+- Run an "eyes" behavior tree in parallel that reflects robot state
+
+The BT is ticked at 10Hz and snapshots are published for visualization
+via py_trees_tree_viewer or rqt_py_trees.
+"""
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Bool
@@ -8,14 +28,19 @@ import py_trees
 import py_trees_ros
 from py_trees.common import Status, ParallelPolicy
 
-# Import the eye leaves
+# Import the eye-related behaviors from a separate module
 from k9_bt_pkg.eyes_bt import EyesTalkingRMS, EyesListening, EyesIdle
 
 
-# -------------------
-# Hotword
-# -------------------
 class WaitForHotword(py_trees.behaviour.Behaviour):
+    """
+    Waits for a Bool message on "hotword_detected".
+
+    - SUCCESS: when hotword is received
+    - RUNNING: otherwise
+    - Resets its internal state on each (re)entry to the tree
+    """
+
     def __init__(self, node: Node, name="WaitForHotword"):
         super().__init__(name)
         self.node = node
@@ -27,19 +52,26 @@ class WaitForHotword(py_trees.behaviour.Behaviour):
         self.hotword = msg.data
 
     def initialise(self):
+        # Always reset when re-entering this behavior
         self.hotword = False
 
     def update(self):
         if self.hotword:
+            # Consume the event, return SUCCESS once
             self.hotword = False
             return Status.SUCCESS
         return Status.RUNNING
 
 
-# -------------------
-# STT
-# -------------------
 class StartListening(py_trees.behaviour.Behaviour):
+    """
+    Calls the "start_listening" EmptySrv service to tell
+    the STT node to begin listening.
+
+    - SUCCESS: once the service responds
+    - RUNNING: while waiting for service or response
+    """
+
     def __init__(self, node: Node, name="StartListening"):
         super().__init__(name)
         self.node = node
@@ -63,6 +95,13 @@ class StartListening(py_trees.behaviour.Behaviour):
 
 
 class CommandReceived(py_trees.behaviour.Behaviour):
+    """
+    Waits until a transcription is received on "speech_to_text/text".
+
+    - SUCCESS: once a command is received
+    - RUNNING: until then
+    """
+
     def __init__(self, node: Node, name="CommandReceived"):
         super().__init__(name)
         self.node = node
@@ -80,11 +119,21 @@ class CommandReceived(py_trees.behaviour.Behaviour):
         return Status.SUCCESS if self.command else Status.RUNNING
 
 
-# -------------------
-# Ollama LLM
-# -------------------
 class GenerateResponse(py_trees.behaviour.Behaviour):
+    """
+    Sends the received command to the "generate_utterance" LLM service.
+
+    - SUCCESS: when response arrives
+    - RUNNING: while waiting for service or response
+    - FAILURE: if no command was available
+    """
+
     def __init__(self, node: Node, command_getter, name="GenerateResponse"):
+        """
+        Args:
+            node: ROS 2 Node
+            command_getter: function that returns the last heard command
+        """
         super().__init__(name)
         self.node = node
         self.command_getter = command_getter
@@ -118,11 +167,23 @@ class GenerateResponse(py_trees.behaviour.Behaviour):
         return Status.RUNNING
 
 
-# -------------------
-# TTS
-# -------------------
 class SpeakResponse(py_trees.behaviour.Behaviour):
+    """
+    Publishes the response text to "voice/tts_input" for TTS playback.
+
+    Optionally waits until the "is_talking" Bool flag clears.
+
+    - SUCCESS: once message sent (and optionally after playback finishes)
+    - FAILURE: if no text available
+    """
+
     def __init__(self, node: Node, text_getter, wait_until_done=True, name="SpeakResponse"):
+        """
+        Args:
+            node: ROS 2 Node
+            text_getter: function that returns response text
+            wait_until_done: if True, block until TTS finishes speaking
+        """
         super().__init__(name)
         self.node = node
         self.text_getter = text_getter
@@ -156,10 +217,13 @@ class SpeakResponse(py_trees.behaviour.Behaviour):
         return Status.RUNNING if self.is_talking else Status.SUCCESS
 
 
-# -------------------
-# Resume Listening
-# -------------------
 class ResumeListening(py_trees.behaviour.Behaviour):
+    """
+    Re-starts the STT listening loop by calling "start_listening".
+
+    This allows K9 to immediately listen again after speaking.
+    """
+
     def __init__(self, node: Node, name="ResumeListening"):
         super().__init__(name)
         self.node = node
@@ -182,10 +246,13 @@ class ResumeListening(py_trees.behaviour.Behaviour):
         return Status.RUNNING
 
 
-# -------------------
-# Build BT
-# -------------------
 def build_main_sequence(node: Node):
+    """
+    Creates the main sequence:
+
+        [WaitForHotword] -> [StartListening] -> [CommandReceived]
+        -> [GenerateResponse] -> [SpeakResponse] -> [ResumeListening]
+    """
     root_seq = py_trees.composites.Sequence("MainSequence", memory=False)
 
     hotword_seq = py_trees.composites.Sequence("HotwordSequence", memory=False)
@@ -203,6 +270,13 @@ def build_main_sequence(node: Node):
 
 
 def build_full_bt(node: Node):
+    """
+    Wraps the main sequence in a Parallel with an EyeSelector:
+
+        Parallel(SuccessOnOne):
+            - MainSequence (speech pipeline)
+            - EyeSelector (idle/listening/talking eye states)
+    """
     root_parallel = py_trees.composites.Parallel(
         name="K9RootParallel",
         policy=ParallelPolicy.SuccessOnOne()
@@ -220,18 +294,21 @@ def build_full_bt(node: Node):
     return root_parallel
 
 
-# -------------------
-# Node Wrapper
-# -------------------
 class K9BTNode(Node):
+    """
+    ROS 2 Node wrapper for the behavior tree.
+    """
     def __init__(self):
         super().__init__("k9_bt")
 
 
-# -------------------
-# Main
-# -------------------
 def main(args=None):
+    """
+    Entry point:
+    - Initialise ROS 2
+    - Build and setup the tree
+    - Tick at 10Hz with automatic snapshot publishing
+    """
     rclpy.init(args=args)
     node = K9BTNode()
 
@@ -241,7 +318,6 @@ def main(args=None):
     tree.setup(node=node, timeout=15.0)
 
     try:
-        # Tick automatically every 100ms and publish snapshots
         tree.tick_tock(period_ms=100, node=node)
     except KeyboardInterrupt:
         pass
