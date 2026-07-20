@@ -16,8 +16,9 @@ from k9_interfaces_pkg.srv import SetBrightness, GetBrightness
 
 import py_trees
 import py_trees_ros
-from py_trees_ros.trees import BehaviourTree
-from py_trees.blackboard import Blackboard
+#from py_trees_ros.trees import BehaviourTree
+#from py_trees.blackboard import Blackboard
+from rclpy.parameter import Parameter
 
 # Initialize components
 #
@@ -31,11 +32,13 @@ k9qa = Respond()
 ChessGame = Backhistory()
 '''
 
+'''
 blackboard = Blackboard()
 blackboard.command = None
 blackboard.intent = None
 blackboard.speaking = 0.0
 blackboard.hotword_detected = False
+'''
 
 class NotListening(py_trees.behaviour.Behaviour):
     def __init__(self, node, name="NotListening"):
@@ -59,6 +62,12 @@ class WaitForHotword(py_trees.behaviour.Behaviour):
         super().__init__(name)
         self.node = node
 
+        self.blackboard = attach_blackboard_client(
+            self,
+            read_keys=("hotword_detected",),
+            write_keys=("hotword_detected",),
+        )
+
     def initialise(self):
         if self.node.is_talking:
             self.logger.info("Still speaking, waiting...")
@@ -67,18 +76,27 @@ class WaitForHotword(py_trees.behaviour.Behaviour):
         self.node.back_lights.turn_on([1,3,6,8,9,12])
         self.node.tail.center()
         self.node.eyes.set_level(0.001)
-        blackboard.hotword_detected = True
+        self.feedback_message = "Waiting for hotword"
 
     def update(self):
-        if blackboard.hotword_detected:
-            return py_trees.common.Status.SUCCESS
-        return py_trees.common.Status.RUNNING
+        if self.blackboard.hotword_detected:
+            return py_trees.common.Status.RUNNING
+        # Consume the event so it triggers only one interaction.
+        self.blackboard.hotword_detected = False
+        self.feedback_message = "Hotword detected"
+        return py_trees.common.Status.SUCCESS
 
 
 class Listening(py_trees.behaviour.Behaviour):
     def __init__(self, node, name="Listening"):
         super().__init__(name)
         self.node = node
+
+        self.blackboard = attach_blackboard_client(
+            self,
+            read_keys=("command",),
+            write_keys=("command",),
+        )
 
     def initialise(self):
         if self.node.is_talking:
@@ -89,127 +107,277 @@ class Listening(py_trees.behaviour.Behaviour):
         self.node.eyes.set_level(0.01)
         if k9stt is None:
             self.logger.error("STT interface not configured")
-            blackboard.command = None
+            self.blackboard.command = None
             return
-        blackboard.command = k9stt.listen_for_command()
+        self.blackboard.command = k9stt.listen_for_command()
         self.node.eyes.set_level(0.0)
 
     def update(self):
-        if blackboard.command:
+        if self.blackboard.command:
             return py_trees.common.Status.SUCCESS
         return py_trees.common.Status.FAILURE
 
 
 class Responding(py_trees.behaviour.Behaviour):
-    def __init__(self, node, name="Responding"):
+    SPECIAL_INTENTS = {
+        "ShowOff",
+        "PlayChess",
+    }
+
+    def __init__(self, node, name="Interpret Command"):
         super().__init__(name)
         self.node = node
+        self.result = py_trees.common.Status.FAILURE
 
     def initialise(self):
-        command = blackboard.command or ""
+        self.result = py_trees.common.Status.FAILURE
+
+        command = self.blackboard.command or ""
+
         if not command:
-            self.logger.warning("Responding involved without a command")
+            self.logger.warning(
+                "Interpret Command invoked without a command"
+            )
+            self.feedback_message = "No command"
             return
+
         self.node.back_lights.on()
         self.node.eyes.set_level(0.5)
         self.node.ears.think()
-        
-        if 'thank' in command:
-            blackboard.intent = 'PraiseMe'
-        elif 'play chess' in command:
-            blackboard.intent = 'PlayChess'
-        elif 'demo' in command:
-            blackboard.intent = 'ShowOff'
-        else:
-            if k9qa is None:
-                self.logger.error("Question-answer interface is not configured")
-                blackboard.intent = None
+
+        intent = None
+        answer = None
+
+        normalised_command = command.casefold()
+
+        try:
+            # Local high-confidence intents can be detected without the LLM.
+            if "play chess" in normalised_command:
+                intent = "PlayChess"
+
+            elif (
+                "demonstration" in normalised_command
+                or "show me what you can do" in normalised_command
+                or "show off" in normalised_command
+                or "demo" in normalised_command
+            ):
+                intent = "ShowOff"
+
+            elif "thank" in normalised_command:
+                answer = "Affirmative. Your gratitude has been noted."
+
+            else:
+                if k9qa is None:
+                    self.logger.error(
+                        "Question-answer interface is not configured"
+                    )
+                    self.feedback_message = "QA unavailable"
+                    return
+
+                intent, answer = k9qa.robot_response(command)
+
+            self.blackboard.command = None
+            self.blackboard.intent = intent
+
+            # A specialist branch will process these on the next tree tick.
+            if intent in self.SPECIAL_INTENTS:
+                self.feedback_message = f"Queued intent: {intent}"
+                self.result = py_trees.common.Status.SUCCESS
                 return
 
-            intent, answer = k9qa.robot_response(command)
-            blackboard.intent = intent
+            # Ordinary question or conversational response.
+            if answer:
+                self.node.voice.speak(answer)
+                self._wait_for_speech()
+            else:
+                self.logger.warning(
+                    f"No answer generated for intent {intent!r}"
+                )
 
-        self.node.ears.stop()
-        self.node.back_lights.off()
+            # No specialist behaviour needs to handle this intent.
+            self.blackboard.intent = None
 
-        #self.node.publisher.publish(Bool(data=True))
-        # Signal that speaking has started, bt should subscribe to
-        # voice node is_talking
-        self.node.voice.speak(command)
+            self.feedback_message = "Response completed"
+            self.result = py_trees.common.Status.SUCCESS
 
-        # Wait until speaking is finished
+        finally:
+            self.node.ears.stop()
+            self.node.back_lights.off()
+            self.node.eyes.set_level(0.1)
+
+    def _wait_for_speech(self):
         deadline = time.monotonic() + 30.0
+
         while self.node.is_talking:
             if time.monotonic() >= deadline:
-                self.logger.warning("Timed out wating for speech to finish")
+                self.logger.warning(
+                    "Timed out waiting for speech to finish"
+                )
                 break
-            rclpy.spin_once(self.node, timeout_sec=0.1)
-        self.node.eyes.set_level(0.1)
+
+            rclpy.spin_once(
+                self.node,
+                timeout_sec=0.1,
+            )
+
         time.sleep(0.75)
 
     def update(self):
-        return py_trees.common.Status.SUCCESS
+        return self.result
 
 
-class Demonstration(py_trees.behaviour.Behaviour):
-    def __init__(self, node, name="Demonstration"):
-        super().__init__(name)
-        self.node = node
+class IntentIs(py_trees.behaviour.Behaviour):
+    """Succeeds only when the current intent matches expected_intent."""
 
-    def initialise(self):
-        self.node.voice.speak("Starting demonstration")
-        # self.node.publisher.publish(Bool(data=True))
-        # Signal talking started; voice node should publish is_talking
-        # and behaviour tree should subscribe
-        deadline = time.monotonic() + 30.0
-        while self.node.is_talking:
-            if time.monotonic() >= deadline:
-                self.logger.warning("Timed out wating for speech to finish")
-                break
-            rclpy.spin_once(self.node, timeout_sec=0.1)
+    def __init__(self, expected_intent: str, name=None):
+        super().__init__(
+            name=name or f"Intent is {expected_intent}"
+        )
+        self.expected_intent = expected_intent
 
     def update(self):
-        return py_trees.common.Status.SUCCESS
+        current_intent = self.blackboard.intent
+
+        self.feedback_message = (
+            f"expected={self.expected_intent!r}, "
+            f"actual={current_intent!r}"
+        )
+
+        if current_intent == self.expected_intent:
+            return py_trees.common.Status.SUCCESS
+
+        return py_trees.common.Status.FAILURE
+
+class Demonstration(py_trees.behaviour.Behaviour):
+    def __init__(self, node, name="Perform Demonstration"):
+        super().__init__(name)
+        self.node = node
+        self.result = py_trees.common.Status.FAILURE
+
+    def initialise(self):
+        self.result = py_trees.common.Status.FAILURE
+
+        # Defensive check: the sequence guard should already guarantee this.
+        if self.blackboard.intent != "ShowOff":
+            self.feedback_message = "ShowOff intent not present"
+            return
+
+        try:
+            self.node.voice.speak("Starting demonstration")
+            self._wait_for_speech()
+
+            #
+            # Put the actual demonstration actions here.
+            #
+            # self.node.tail.wag_h()
+            # self.node.ears.scan()
+            # self.node.back_lights.turn_on([...])
+            #
+
+            self.feedback_message = "Demonstration completed"
+            self.result = py_trees.common.Status.SUCCESS
+
+        finally:
+            # Consume the intent even if part of the demonstration failed.
+            self.blackboard.intent = None
+            self.blackboard.command = None
+
+    def _wait_for_speech(self):
+        deadline = time.monotonic() + 30.0
+
+        while self.node.is_talking:
+            if time.monotonic() >= deadline:
+                self.logger.warning(
+                    "Timed out waiting for speech to finish"
+                )
+                break
+
+            rclpy.spin_once(
+                self.node,
+                timeout_sec=0.1,
+            )
+
+    def update(self):
+        return self.result
 
 
 class PlayChess(py_trees.behaviour.Behaviour):
-    def __init__(self, node, name="PlayChess"):
+    def __init__(self, node, name="Start Chess"):
         super().__init__(name)
         self.node = node
+        self.game = None
+        self.result = py_trees.common.Status.FAILURE
 
     def initialise(self):
-        if ChessGame is None:
-            self.logger.error("ChessGame is not configured")
-            self.game = None
+        self.result = py_trees.common.Status.FAILURE
+
+        if self.blackboard.intent != "PlayChess":
+            self.feedback_message = "PlayChess intent not present"
             return
 
-        self.game = ChessGame()
-        blackboard.intent = None
+        try:
+            if ChessGame is None:
+                self.logger.error("ChessGame is not configured")
+                self.feedback_message = "Chess unavailable"
+                return
+
+            self.game = ChessGame()
+            self.feedback_message = "Chess started"
+            self.result = py_trees.common.Status.SUCCESS
+
+        finally:
+            self.blackboard.intent = None
+            self.blackboard.command = None
 
     def update(self):
-        return py_trees.common.Status.SUCCESS
+        return self.result
 
 
 def create_behavior_tree(node):
     root = py_trees.composites.Selector(
-        name = "K9_Audio",
-        memory= False,
+        name="K9",
+        memory=False,
     )
 
-    demonstration = Demonstration(node)
-    play_chess = PlayChess(node)
-    respond = Responding(node)
-    listen = Listening(node)
-    wait = WaitForHotword(node)
-    idle = NotListening(node)
+    demonstration_branch = py_trees.composites.Sequence(
+        name="Handle Demonstration",
+        memory=False,
+        children=[
+            IntentIs(
+                expected_intent="ShowOff",
+                name="Demonstration Requested?",
+            ),
+            Demonstration(node),
+        ],
+    )
+
+    chess_branch = py_trees.composites.Sequence(
+        name="Handle Chess",
+        memory=False,
+        children=[
+            IntentIs(
+                expected_intent="PlayChess",
+                name="Chess Requested?",
+            ),
+            PlayChess(node),
+        ],
+    )
+
+    interaction_branch = py_trees.composites.Sequence(
+        name="Handle Voice Interaction",
+        memory=True,
+        children=[
+            NotListening(node),
+            WaitForHotword(node),
+            Listening(node),
+            Responding(node),
+        ],
+    )
 
     root.add_children([
-        demonstration,
-        play_chess,
-        respond,
-        listen,
-        wait,
-        idle
+        demonstration_branch,
+        chess_branch,
+        interaction_branch,
     ])
 
     return root
@@ -230,29 +398,76 @@ class K9BTNode(Node):
 
         self.is_talking = False
 
+        self.blackboard_initialiser = initialise_blackboard()
+
         # Publisher for is_talking status
         # self.publisher = self.create_publisher(Bool, 'is_talking', 10)
 
-        # Subscribe to the 'is_talking' topic
+        # Subscribe to the 'is_talking' and 'hotword_detected' topics
         self.subscription = self.create_subscription(
             Bool,
             'is_talking',
             self.is_talking_callback,
             10
         )
+
+        self.hotword_subscription = self.create_subscription(
+            Bool,
+            'hotword_detected',
+            self.hotword_detected_callback,
+            10,
+        )
         
         root = create_behavior_tree(self)
-        self.bt = BehaviourTree(root)
+        self.bt = py_trees_ros.trees.BehaviourTree(
+            root=root,
+            unicode_tree_debug=False,
+        )
         self.bt.setup(
             node=self,
             timeout=15.0,
         )
+        # Configure the standard snapshot stream.
+        #
+        # Set the configuration parameters first, then enable the stream.
+        # The order matters because enabling the stream reads the other
+        # parameter values.
+        self.set_parameters([
+            Parameter(
+                "default_snapshot_period",
+                Parameter.Type.DOUBLE,
+                0.5,
+            ),
+            Parameter(
+                "default_snapshot_blackboard_data",
+                Parameter.Type.BOOL,
+                True,
+            ),
+            Parameter(
+                "default_snapshot_blackboard_activity",
+                Parameter.Type.BOOL,
+                True,
+            ),
+        ])
+
+        self.set_parameters([
+            Parameter(
+                "default_snapshot_stream",
+                Parameter.Type.BOOL,
+                True,
+            ),
+        ])
         # self.bt.tick_tock(period_ms=500)
         # Tree behaves syncrhonously bit tick_tock() uses callback
         # behaviours need to be rewritten to use asyn futures
     
     def is_talking_callback(self, msg):
         self.is_talking = msg.data
+
+    def hotword_detected_callback(self, msg: Bool):
+        if msg.data:
+            self.blackboard.hotword_detected = True
+            self.get_logger().info("Hotword detected")
 
 
 class ServiceClientHelper:
@@ -292,6 +507,56 @@ class ServiceClientHelper:
             f"Service response: {result}"
         )
         return result
+
+def attach_blackboard_client(
+    behaviour,
+    read_keys=(),
+    write_keys=(),
+):
+    """Attach a tracked blackboard client to a behaviour."""
+
+    client = behaviour.attach_blackboard_client(
+        name=f"{behaviour.name} Blackboard",
+    )
+
+    for key in read_keys:
+        client.register_key(
+            key=key,
+            access=py_trees.common.Access.READ,
+        )
+
+    for key in write_keys:
+        client.register_key(
+            key=key,
+            access=py_trees.common.Access.WRITE,
+        )
+
+    return client
+
+def initialise_blackboard():
+    client = py_trees.blackboard.Client(
+        name="K9 Blackboard Initialiser",
+    )
+
+    initial_values = {
+        "command": None,
+        "intent": None,
+        "speaking": 0.0,
+        "hotword_detected": False,
+    }
+
+    for key, value in initial_values.items():
+        client.register_key(
+            key=key,
+            access=py_trees.common.Access.WRITE,
+        )
+        client.set(
+            name=key,
+            value=value,
+            overwrite=True,
+        )
+
+    return client
 
 class Voice:
     def __init__(self, node: Node, service_helper: ServiceClientHelper):
