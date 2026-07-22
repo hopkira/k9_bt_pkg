@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """Visible, non-blocking behaviour-tree shell for K9.
 
-This first increment deliberately contains:
-  * the complete intended tree hierarchy;
-  * placeholder leaf behaviours only;
-  * no service clients;
-  * no hardware access;
-  * no blocking waits.
+Increment 2 adds:
+  * a namespaced /k9 blackboard;
+  * registered and initialised executive state fields;
+  * simple fundamental values suitable for ROS blackboard introspection.
 
-The tree ticks continuously and exposes py_trees_ros snapshot services plus a
-default snapshot topic for py-trees-tree-viewer / py-trees-tree-watcher.
+The behaviour leaves remain placeholders. There are still no K9 service
+clients, hardware calls or blocking waits.
 """
 
 from __future__ import annotations
@@ -21,6 +19,19 @@ import py_trees_ros
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+
+try:
+    # Normal installed-package / ros2 run path.
+    from k9_bt_pkg.k9_blackboard import (
+        BlackboardKey,
+        K9Blackboard,
+    )
+except ModuleNotFoundError:
+    # Convenient direct execution from the source directory.
+    from k9_blackboard import (
+        BlackboardKey,
+        K9Blackboard,
+    )
 
 
 @dataclass(frozen=True)
@@ -202,7 +213,7 @@ def create_expression_manager() -> py_trees.behaviour.Behaviour:
 
 
 def create_tree() -> py_trees.behaviour.Behaviour:
-    """Construct the complete first-increment K9 hierarchy."""
+    """Construct the complete K9 hierarchy."""
 
     emergency_mode = sequence("Emergency Mode")
     emergency_mode.add_children(
@@ -242,7 +253,7 @@ def create_tree() -> py_trees.behaviour.Behaviour:
 
 
 class K9BehaviourTreeShell(Node):
-    """ROS 2 custodian for the visible K9 behaviour-tree shell."""
+    """ROS 2 custodian for the K9 behaviour-tree and shared blackboard."""
 
     def __init__(self) -> None:
         super().__init__("k9_bt_shell")
@@ -253,6 +264,14 @@ class K9BehaviourTreeShell(Node):
         )
         if tick_period_ms <= 0.0:
             raise ValueError("tick_period_ms must be greater than zero")
+
+        # Create and initialise the central /k9 blackboard before the tree ticks.
+        # The wrapper provides canonical keys and lightweight type checking.
+        self.blackboard = K9Blackboard()
+        self.blackboard.set(
+            BlackboardKey.SYSTEM_STATUS,
+            "INITIALISING_TREE",
+        )
 
         root = create_tree()
 
@@ -281,6 +300,11 @@ class K9BehaviourTreeShell(Node):
                     Parameter.Type.BOOL,
                     True,
                 ),
+                Parameter(
+                    "default_snapshot_blackboard_data",
+                    Parameter.Type.BOOL,
+                    True,
+                ),
             ]
         )
         for result in parameter_results:
@@ -290,25 +314,35 @@ class K9BehaviourTreeShell(Node):
                     f"{result.reason}"
                 )
 
+        self.blackboard.set(
+            BlackboardKey.SYSTEM_READY,
+            True,
+        )
+        self.blackboard.set(
+            BlackboardKey.SYSTEM_STATUS,
+            "RUNNING",
+        )
+
         # Tick once immediately so a newly opened viewer does not need to wait
         # for the first timer callback.
         self.tree.tick()
 
-        # py_trees_ros implements this with an rclpy timer. It does not start a
-        # second blocking loop or require a node argument here.
+        # py_trees_ros implements this with an rclpy timer.
         self.tree.tick_tock(period_ms=tick_period_ms)
 
+        self.get_logger().info("K9 behaviour-tree shell is running")
         self.get_logger().info(
-            "K9 visible tree shell is running"
+            f"Initialised {self.blackboard.field_count} blackboard fields "
+            "beneath /k9"
         )
         self.get_logger().info(
             f"Tick period: {tick_period_ms:.0f} ms"
         )
         self.get_logger().info(
-            "Default snapshot topic: /k9_bt_shell/snapshots"
+            "Tree snapshots: /k9_bt_shell/snapshots"
         )
         self.get_logger().info(
-            "Open py-trees-tree-viewer or run py-trees-tree-watcher"
+            "Inspect state with: py-trees-blackboard-watcher"
         )
 
 
@@ -325,6 +359,14 @@ def main(args=None) -> None:
 
     finally:
         if node is not None:
+            node.blackboard.set(
+                BlackboardKey.SYSTEM_READY,
+                False,
+            )
+            node.blackboard.set(
+                BlackboardKey.SYSTEM_STATUS,
+                "STOPPED",
+            )
             node.tree.shutdown(destroy_node=False)
             node.destroy_node()
 

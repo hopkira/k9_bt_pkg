@@ -88,3 +88,136 @@ K9 Root
 ```
 
 The root and all four normal-operation managers remain RUNNING.
+
+# K9 behaviour-tree shell — blackboard increment
+
+This increment preserves the visible behaviour-tree hierarchy and adds a
+central, namespaced blackboard containing the state required by the current K9
+executive design.
+
+## Files
+
+- `k9_bt_shell.py` — the visible tree and ROS node.
+- `k9_blackboard.py` — canonical keys, states, schema, defaults and typed access.
+
+## Install
+
+```bash
+cp k9_bt_shell.py \
+  ~/k9_ws/src/k9_bt_pkg/k9_bt_pkg/k9_bt_shell.py
+
+cp k9_blackboard.py \
+  ~/k9_ws/src/k9_bt_pkg/k9_bt_pkg/k9_blackboard.py
+
+chmod +x \
+  ~/k9_ws/src/k9_bt_pkg/k9_bt_pkg/k9_bt_shell.py
+```
+
+Your existing `setup.py` console entry remains:
+
+```python
+'k9_bt_shell = k9_bt_pkg.k9_bt_shell:main',
+```
+
+Build and run:
+
+```bash
+cd ~/k9_ws
+
+source /opt/ros/jazzy/setup.bash
+
+colcon build \
+  --symlink-install \
+  --packages-select k9_bt_pkg
+
+source install/setup.bash
+
+ros2 run k9_bt_pkg k9_bt_shell
+```
+
+## Inspect the blackboard
+
+List every registered key:
+
+```bash
+py-trees-blackboard-watcher --list
+```
+
+Stream the complete blackboard:
+
+```bash
+py-trees-blackboard-watcher
+```
+
+Stream selected values:
+
+```bash
+py-trees-blackboard-watcher \
+  /k9/system/status \
+  /k9/audio/desired_mode \
+  /k9/audio/effective_mode \
+  /k9/dialogue/intent \
+  /k9/chess/state
+```
+
+Include recent read/write activity:
+
+```bash
+py-trees-blackboard-watcher --activity
+```
+
+Include blackboard information in the tree watcher:
+
+```bash
+py-trees-tree-watcher -b
+```
+
+## Schema groups
+
+The blackboard contains fundamental Python values beneath:
+
+```text
+/k9/system/*
+/k9/safety/*
+/k9/battery/*
+/k9/audio/*
+/k9/dialogue/*
+/k9/speech/*
+/k9/chess/*
+/k9/expression/*
+```
+
+The shell initialises the system to:
+
+```text
+/k9/system/mode                    NORMAL
+/k9/system/ready                   true
+/k9/system/status                  RUNNING
+/k9/safety/emergency_active        false
+/k9/audio/desired_mode             WAITING_FOR_HOTWORD
+/k9/audio/effective_mode           NOT_LISTENING
+/k9/dialogue/state                 IDLE
+/k9/dialogue/intent                NONE
+/k9/speech/state                   IDLE
+/k9/chess/state                    IDLE
+/k9/expression/effective           NOT_LISTENING
+```
+
+## Design rules for later behaviours
+
+Later behaviours should import `BlackboardKey` and attach their own client with
+only the access they require:
+
+```python
+self.blackboard = self.attach_blackboard_client(
+    name="Emergency Condition",
+    namespace="k9",
+)
+self.blackboard.register_key(
+    key=BlackboardKey.SAFETY_EMERGENCY_BUTTON_PRESSED,
+    access=py_trees.common.Access.READ,
+)
+```
+
+Avoid hard-coded strings outside `k9_blackboard.py`. This makes misspelled keys
+less likely and keeps the watcher output stable while the implementation grows.
