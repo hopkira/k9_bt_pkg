@@ -24,12 +24,14 @@ from rclpy.parameter import Parameter
 try:
     # Normal installed-package / ros2 run path.
     from k9_bt_pkg.k9_blackboard import (
+        AudioMode,
         BlackboardKey,
         K9Blackboard,
     )
 except ModuleNotFoundError:
     # Convenient direct execution from the source directory.
     from k9_blackboard import (
+        AudioMode,
         BlackboardKey,
         K9Blackboard,
     )
@@ -57,6 +59,38 @@ class Placeholder(py_trees.behaviour.Behaviour):
     def update(self) -> py_trees.common.Status:
         self.feedback_message = self.result.feedback
         return self.result.status
+
+
+class BlackboardEquals(py_trees.behaviour.Behaviour):
+    """SUCCESS when a K9 blackboard value equals the requested value."""
+
+    def __init__(self, name: str, key: str, expected) -> None:
+        super().__init__(name=name)
+
+        self.key = key
+        self.expected = expected
+
+        self.blackboard = py_trees.blackboard.Client(
+            name=name,
+            namespace="K9",
+        )
+        self.blackboard.register_key(
+            key=key,
+            access=py_trees.common.Access.READ,
+        )
+
+    def update(self) -> py_trees.common.Status:
+        actual = self.blackboard.get(self.key)
+
+        self.feedback_message = (
+            f"{actual!r} {'==' if actual == self.expected else '!='} "
+            f"{self.expected!r}"
+        )
+
+        if actual == self.expected:
+            return py_trees.common.Status.SUCCESS
+
+        return py_trees.common.Status.FAILURE
 
 
 class ProcessAudioEvents(py_trees.behaviour.Behaviour):
@@ -151,6 +185,112 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.RUNNING
 
 
+class MaintainAudioMode(py_trees.behaviour.Behaviour):
+    """Maintain one effective audio mode and publish it to ROS."""
+
+    def __init__(
+        self,
+        node: Node,
+        name: str,
+        mode: str,
+    ) -> None:
+        super().__init__(name=name)
+
+        self.node = node
+        self.mode = mode
+
+        self.blackboard = py_trees.blackboard.Client(
+            name=name,
+            namespace="K9",
+        )
+        self.blackboard.register_key(
+            key=BlackboardKey.AUDIO_EFFECTIVE_MODE,
+            access=py_trees.common.Access.WRITE,
+        )
+
+        self.publisher = node.create_publisher(
+            String,
+            "/audio/effective_state",
+            10,
+        )
+
+    def update(self) -> py_trees.common.Status:
+        current = self.blackboard.get(
+            BlackboardKey.AUDIO_EFFECTIVE_MODE
+        )
+
+        if current != self.mode:
+            self.blackboard.set(
+                BlackboardKey.AUDIO_EFFECTIVE_MODE,
+                self.mode,
+                overwrite=True,
+            )
+
+            self.node.get_logger().info(
+                f"Effective audio state: {current} -> {self.mode}"
+            )
+
+        # Deliberately publish every BT tick.
+        #
+        # This means a hotword/STT node that restarts will quickly receive
+        # the current effective state even though the ROS topic is volatile.
+        self.publisher.publish(String(data=self.mode))
+
+        self.feedback_message = f"maintaining {self.mode}"
+
+        return py_trees.common.Status.RUNNING
+
+
+class HandleHotwordDetected(py_trees.behaviour.Behaviour):
+    """Convert a latched hotword event into a request to listen."""
+
+    def __init__(self) -> None:
+        super().__init__(name="Handle Hotword Detected")
+
+        self.blackboard = py_trees.blackboard.Client(
+            name="Handle Hotword Detected",
+            namespace="K9",
+        )
+
+        self.blackboard.register_key(
+            key=BlackboardKey.AUDIO_HOTWORD_DETECTED,
+            access=py_trees.common.Access.READ,
+        )
+        self.blackboard.register_key(
+            key=BlackboardKey.AUDIO_HOTWORD_DETECTED,
+            access=py_trees.common.Access.WRITE,
+        )
+        self.blackboard.register_key(
+            key=BlackboardKey.AUDIO_DESIRED_MODE,
+            access=py_trees.common.Access.WRITE,
+        )
+
+    def update(self) -> py_trees.common.Status:
+        detected = self.blackboard.get(
+            BlackboardKey.AUDIO_HOTWORD_DETECTED
+        )
+
+        if not detected:
+            self.feedback_message = "no hotword pending"
+            return py_trees.common.Status.FAILURE
+
+        self.blackboard.set(
+            BlackboardKey.AUDIO_HOTWORD_DETECTED,
+            False,
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            AudioMode.LISTENING,
+            overwrite=True,
+        )
+
+        self.feedback_message = "requested LISTENING"
+
+        return py_trees.common.Status.SUCCESS
+
+
 RUNNING = PlaceholderResult(
     status=py_trees.common.Status.RUNNING,
     feedback="shell: maintaining state",
@@ -201,7 +341,6 @@ def parallel(name: str) -> py_trees.composites.Parallel:
         ),
     )
 
-
 def create_audio_state_manager(
     node: Node,
 ) -> py_trees.behaviour.Behaviour:
@@ -210,24 +349,48 @@ def create_audio_state_manager(
     talking_override = sequence("Talking Override")
     talking_override.add_children(
         [
-            inactive("K9 Talking?"),
-            running("Ensure NotListening"),
+            BlackboardEquals(
+                "K9 Talking?",
+                BlackboardKey.AUDIO_IS_TALKING,
+                True,
+            ),
+            MaintainAudioMode(
+                node,
+                "Ensure NotListening",
+                AudioMode.NOT_LISTENING,
+            ),
         ]
     )
 
     listening_state = sequence("Listening State")
     listening_state.add_children(
         [
-            inactive("Desired = Listening?"),
-            running("Maintain Listening"),
+            BlackboardEquals(
+                "Desired = Listening?",
+                BlackboardKey.AUDIO_DESIRED_MODE,
+                AudioMode.LISTENING,
+            ),
+            MaintainAudioMode(
+                node,
+                "Maintain Listening",
+                AudioMode.LISTENING,
+            ),
         ]
     )
 
     hotword_state = sequence("Hotword State")
     hotword_state.add_children(
         [
-            inactive("Desired = WaitingForHotword?"),
-            running("Maintain Hotword Detector"),
+            BlackboardEquals(
+                "Desired = WaitingForHotword?",
+                BlackboardKey.AUDIO_DESIRED_MODE,
+                AudioMode.WAITING_FOR_HOTWORD,
+            ),
+            MaintainAudioMode(
+                node,
+                "Maintain Hotword Detector",
+                AudioMode.WAITING_FOR_HOTWORD,
+            ),
         ]
     )
 
@@ -239,7 +402,11 @@ def create_audio_state_manager(
             talking_override,
             listening_state,
             hotword_state,
-            running("Maintain NotListening"),
+            MaintainAudioMode(
+                node,
+                "Maintain NotListening",
+                AudioMode.NOT_LISTENING,
+            ),
         ]
     )
 
@@ -250,13 +417,16 @@ def create_audio_state_manager(
             maintain_effective_audio_state,
         ]
     )
+
     return audio_state_manager
+
 
 
 def create_dialogue_manager() -> py_trees.behaviour.Behaviour:
     dialogue_manager = selector("Dialogue Manager")
     dialogue_manager.add_children(
         [
+            HandleHotwordDetected(),
             no_work("Handle StopListening Intent"),
             no_work("Handle PlayChess Intent"),
             no_work("Handle Chess Setup Answer"),
