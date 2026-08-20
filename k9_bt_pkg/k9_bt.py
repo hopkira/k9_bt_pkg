@@ -59,6 +59,98 @@ class Placeholder(py_trees.behaviour.Behaviour):
         return self.result.status
 
 
+class ProcessAudioEvents(py_trees.behaviour.Behaviour):
+    """Receive ROS audio events and reflect them onto the K9 blackboard."""
+
+    def __init__(self, node: Node) -> None:
+        super().__init__(name="Process Audio Events")
+
+        self.node = node
+
+        self.blackboard = py_trees.blackboard.Client(
+            name="Process Audio Events",
+            namespace="K9",
+        )
+
+        for key in [
+            BlackboardKey.AUDIO_HOTWORD_DETECTED,
+            BlackboardKey.AUDIO_IS_LISTENING,
+            BlackboardKey.AUDIO_HEARD_TEXT,
+            BlackboardKey.AUDIO_LAST_EVENT,
+        ]:
+            self.blackboard.register_key(
+                key=key,
+                access=py_trees.common.Access.WRITE,
+            )
+
+        self.hotword_subscription = node.create_subscription(
+            Bool,
+            "/hotword_detected",
+            self._hotword_callback,
+            10,
+        )
+
+        self.stt_state_subscription = node.create_subscription(
+            String,
+            "/speech_to_text/state",
+            self._stt_state_callback,
+            10,
+        )
+
+        self.stt_text_subscription = node.create_subscription(
+            String,
+            "/speech_to_text/text",
+            self._stt_text_callback,
+            10,
+        )
+
+    def _hotword_callback(self, msg: Bool) -> None:
+        # Treat True as an event and latch it until a BT behaviour consumes it.
+        if msg.data:
+            self.blackboard.set(
+                BlackboardKey.AUDIO_HOTWORD_DETECTED,
+                True,
+                overwrite=True,
+            )
+
+            self.blackboard.set(
+                BlackboardKey.AUDIO_LAST_EVENT,
+                "HOTWORD_DETECTED",
+                overwrite=True,
+            )
+
+    def _stt_state_callback(self, msg: String) -> None:
+        state = msg.data.strip()
+
+        self.blackboard.set(
+            BlackboardKey.AUDIO_IS_LISTENING,
+            state.lower() == "listening",
+            overwrite=True,
+        )
+
+    def _stt_text_callback(self, msg: String) -> None:
+        text = msg.data.strip()
+
+        if not text:
+            return
+
+        self.blackboard.set(
+            BlackboardKey.AUDIO_HEARD_TEXT,
+            text,
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.AUDIO_LAST_EVENT,
+            "UTTERANCE_RECEIVED",
+            overwrite=True,
+        )
+
+    def update(self) -> py_trees.common.Status:
+        self.feedback_message = "monitoring ROS audio events"
+        return py_trees.common.Status.RUNNING
+
+
 RUNNING = PlaceholderResult(
     status=py_trees.common.Status.RUNNING,
     feedback="shell: maintaining state",
@@ -110,8 +202,10 @@ def parallel(name: str) -> py_trees.composites.Parallel:
     )
 
 
-def create_audio_state_manager() -> py_trees.behaviour.Behaviour:
-    process_audio_events = running("Process Audio Events")
+def create_audio_state_manager(
+    node: Node,
+) -> py_trees.behaviour.Behaviour:
+    process_audio_events = ProcessAudioEvents(node)
 
     talking_override = sequence("Talking Override")
     talking_override.add_children(
@@ -213,7 +307,7 @@ def create_expression_manager() -> py_trees.behaviour.Behaviour:
     return expression_manager
 
 
-def create_tree() -> py_trees.behaviour.Behaviour:
+def create_tree(node: Node) -> py_trees.behaviour.Behaviour:
     """Construct the complete K9 hierarchy."""
 
     emergency_mode = sequence("Emergency Mode")
@@ -227,7 +321,7 @@ def create_tree() -> py_trees.behaviour.Behaviour:
     normal_operation = parallel("Normal Operation")
     normal_operation.add_children(
         [
-            create_audio_state_manager(),
+            create_audio_state_manager(node),
             create_dialogue_manager(),
             create_chess_manager(),
             create_expression_manager(),
@@ -274,7 +368,7 @@ class K9BehaviourTreeShell(Node):
             "INITIALISING_TREE",
         )
 
-        root = create_tree()
+        root = create_tree(self)
 
         # py_trees_ros adds snapshot-stream services and blackboard
         # introspection around the ordinary py_trees hierarchy.
