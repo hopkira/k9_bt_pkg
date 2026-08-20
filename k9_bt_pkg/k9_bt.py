@@ -72,7 +72,7 @@ class BlackboardEquals(py_trees.behaviour.Behaviour):
 
         self.blackboard = py_trees.blackboard.Client(
             name=name,
-            namespace="K9",
+            namespace="k9",
         )
         self.blackboard.register_key(
             key=key,
@@ -103,7 +103,7 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
 
         self.blackboard = py_trees.blackboard.Client(
             name="Process Audio Events",
-            namespace="K9",
+            namespace="k9",
         )
 
         for key in [
@@ -201,7 +201,7 @@ class MaintainAudioMode(py_trees.behaviour.Behaviour):
 
         self.blackboard = py_trees.blackboard.Client(
             name=name,
-            namespace="K9",
+            namespace="k9",
         )
         self.blackboard.register_key(
             key=BlackboardKey.AUDIO_EFFECTIVE_MODE,
@@ -249,7 +249,7 @@ class HandleHotwordDetected(py_trees.behaviour.Behaviour):
 
         self.blackboard = py_trees.blackboard.Client(
             name="Handle Hotword Detected",
-            namespace="K9",
+            namespace="k9",
         )
 
         self.blackboard.register_key(
