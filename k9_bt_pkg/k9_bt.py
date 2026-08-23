@@ -13,6 +13,7 @@ clients, hardware calls or blocking waits.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from platform import node
 
 import py_trees
 import py_trees_ros
@@ -20,6 +21,8 @@ import rclpy
 from std_msgs.msg import Bool, String
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.action import ActionClient
+from k9_interfaces_pkg.action import SpeakText
 
 try:
     # Normal installed-package / ros2 run path.
@@ -296,6 +299,204 @@ class HandleHotwordDetected(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
+class HandleUtteranceReceived(py_trees.behaviour.Behaviour):
+
+    def __init__(self, name="Handle Utterance Received"):
+        super().__init__(name=name)
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        self.blackboard.register_key(
+            key=BlackboardKey.AUDIO_HEARD_TEXT,
+            access=py_trees.common.Access.WRITE,
+        )
+
+        self.blackboard.register_key(
+            key=BlackboardKey.AUDIO_DESIRED_MODE,
+            access=py_trees.common.Access.WRITE,
+        )
+
+        self.blackboard.register_key(
+            key=BlackboardKey.DIALOGUE_COMMAND,
+            access=py_trees.common.Access.WRITE,
+        )
+
+        self.blackboard.register_key(
+            key=BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+            access=py_trees.common.Access.WRITE,
+        )
+
+    def update(self):
+
+        text = self.blackboard.get(
+            BlackboardKey.AUDIO_HEARD_TEXT
+        ).strip()
+
+        if not text:
+            return py_trees.common.Status.FAILURE
+
+        # Preserve what the user said for the dialogue manager.
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_COMMAND,
+            text,
+            overwrite=True,
+        )
+
+        # For this first end-to-end test, generate a simple response.
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+            f"Affirmative. I heard you say {text}",
+            overwrite=True,
+        )
+
+        # The utterance is now consumed.
+        self.blackboard.set(
+            BlackboardKey.AUDIO_HEARD_TEXT,
+            "",
+            overwrite=True,
+        )
+
+        # Stop STT while we formulate/speak the response.
+        self.blackboard.set(
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            AudioMode.NOT_LISTENING,
+            overwrite=True,
+        )
+
+        self.feedback_message = f"consumed: {text}"
+
+        return py_trees.common.Status.SUCCESS
+
+class SpeakPendingResponse(py_trees.behaviour.Behaviour):
+
+    def __init__(self, *, node, name="Speak Pending Response"):
+        super().__init__(name=name)
+
+        self.node = node
+
+        self.client = ActionClient(
+            node,
+            SpeakText,
+            "/voice/speak",
+        )
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        self.blackboard.register_key(
+            key=BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+            access=py_trees.common.Access.WRITE,
+        )
+
+        self.blackboard.register_key(
+            key=BlackboardKey.AUDIO_DESIRED_MODE,
+            access=py_trees.common.Access.WRITE,
+        )
+
+        self.goal_future = None
+        self.goal_handle = None
+        self.result_future = None
+        self.response_text = ""
+
+    def initialise(self):
+
+        self.goal_future = None
+        self.goal_handle = None
+        self.result_future = None
+
+        self.response_text = self.blackboard.get(
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE
+        ).strip()
+
+        if not self.response_text:
+            return
+
+        if not self.client.server_is_ready():
+            self.feedback_message = "voice action server unavailable"
+            return
+
+        goal = SpeakText.Goal()
+
+        goal.text = self.response_text
+        goal.owner = "dialogue"
+        goal.priority = 100
+        goal.interrupt_lower_priority = True
+        goal.clear_lower_priority = True
+
+        self.goal_future = self.client.send_goal_async(goal)
+
+        self.feedback_message = "speech goal submitted"
+
+    def update(self):
+
+        if not self.response_text:
+            return py_trees.common.Status.FAILURE
+
+        if self.goal_future is None:
+            self.feedback_message = "voice server unavailable"
+            return py_trees.common.Status.FAILURE
+
+        #
+        # Waiting for voice server to accept goal
+        #
+
+        if self.goal_handle is None:
+
+            if not self.goal_future.done():
+                self.feedback_message = "waiting for speech goal acceptance"
+                return py_trees.common.Status.RUNNING
+
+            self.goal_handle = self.goal_future.result()
+
+            if not self.goal_handle.accepted:
+                self.feedback_message = "speech goal rejected"
+                return py_trees.common.Status.FAILURE
+
+            self.result_future = self.goal_handle.get_result_async()
+
+            self.feedback_message = "speaking"
+            return py_trees.common.Status.RUNNING
+
+        #
+        # Voice is still speaking
+        #
+
+        if not self.result_future.done():
+            self.feedback_message = "speaking"
+            return py_trees.common.Status.RUNNING
+
+        #
+        # Speech completed
+        #
+
+        result = self.result_future.result().result
+
+        if not result.success:
+            self.feedback_message = result.message
+            return py_trees.common.Status.FAILURE
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+            "",
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            AudioMode.WAITING_FOR_HOTWORD,
+            overwrite=True,
+        )
+
+        self.feedback_message = "speech complete"
+
+        return py_trees.common.Status.SUCCESS
+
+
 RUNNING = PlaceholderResult(
     status=py_trees.common.Status.RUNNING,
     feedback="shell: maintaining state",
@@ -432,11 +633,12 @@ def create_dialogue_manager() -> py_trees.behaviour.Behaviour:
     dialogue_manager.add_children(
         [
             HandleHotwordDetected(),
+            HandleUtteranceReceived(),
             no_work("Handle StopListening Intent"),
             no_work("Handle PlayChess Intent"),
             no_work("Handle Chess Setup Answer"),
             no_work("Handle General Conversation"),
-            no_work("Speak Pending Response"),
+            SpeakPendingResponse(node=node),
             running("Dialogue Idle"),
         ]
     )
