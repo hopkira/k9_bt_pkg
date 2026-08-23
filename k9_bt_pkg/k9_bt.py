@@ -154,11 +154,16 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
             )
 
     def _stt_state_callback(self, msg: String) -> None:
-        state = msg.data.strip()
+        state = msg.data.strip().lower()
+
+        is_listening = state in {
+            "listening",
+            "speech",
+        }
 
         self.blackboard.set(
             BlackboardKey.AUDIO_IS_LISTENING,
-            state.lower() == "listening",
+            is_listening,
             overwrite=True,
         )
 
