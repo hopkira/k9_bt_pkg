@@ -699,7 +699,7 @@ def create_tree(node: Node) -> py_trees.behaviour.Behaviour:
     normal_operation.add_children(
         [
             create_audio_state_manager(node),
-            create_dialogue_manager(),
+            create_dialogue_manager(node),
             create_chess_manager(),
             create_expression_manager(),
         ]
