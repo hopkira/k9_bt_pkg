@@ -628,7 +628,7 @@ def create_audio_state_manager(
 
 
 
-def create_dialogue_manager() -> py_trees.behaviour.Behaviour:
+def create_dialogue_manager(node) -> py_trees.behaviour.Behaviour:
     dialogue_manager = selector("Dialogue Manager")
     dialogue_manager.add_children(
         [
