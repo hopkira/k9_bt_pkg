@@ -1,34 +1,47 @@
 #!/usr/bin/env python3
 """Visible, non-blocking behaviour-tree shell for K9.
 
-Increment 2 adds:
-  * a namespaced /k9 blackboard;
-  * registered and initialised executive state fields;
-  * simple fundamental values suitable for ROS blackboard introspection.
+This version implements the persistent repeat-back conversation test:
 
-The behaviour leaves remain placeholders. There are still no K9 service
-clients, hardware calls or blocking waits.
+    WAITING_FOR_HOTWORD
+        -> hotword
+        -> LISTENING
+        -> utterance / intent
+        -> repeat back
+        -> LISTENING
+        -> ...
+        -> STOP_LISTENING
+        -> WAITING_FOR_HOTWORD
+
+The desired audio mode remains LISTENING for the lifetime of an active
+conversation.  While K9 is physically speaking, /voice/is_talking temporarily
+forces the effective audio mode to NOT_LISTENING.  When speech finishes, the
+effective mode therefore returns to LISTENING and the STT node begins a fresh
+listening session.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from platform import node
 
 import py_trees
 import py_trees_ros
 import rclpy
-from std_msgs.msg import Bool, String
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.action import ActionClient
+from std_msgs.msg import Bool, String
+
 from k9_interfaces_pkg.action import SpeakText
+from k9_interfaces_pkg.msg import IntentResult
 
 try:
     # Normal installed-package / ros2 run path.
     from k9_bt_pkg.k9_blackboard import (
         AudioMode,
         BlackboardKey,
+        DialogueState,
+        Intent,
         K9Blackboard,
     )
 except ModuleNotFoundError:
@@ -36,9 +49,89 @@ except ModuleNotFoundError:
     from k9_blackboard import (
         AudioMode,
         BlackboardKey,
+        DialogueState,
+        Intent,
         K9Blackboard,
     )
 
+
+# ---------------------------------------------------------------------------
+# Small blackboard helpers
+# ---------------------------------------------------------------------------
+
+def register_read_write(
+    client: py_trees.blackboard.Client,
+    key: str,
+) -> None:
+    """Register both READ and WRITE access for one blackboard key."""
+    client.register_key(
+        key=key,
+        access=py_trees.common.Access.READ,
+    )
+    client.register_key(
+        key=key,
+        access=py_trees.common.Access.WRITE,
+    )
+
+
+def clear_dialogue_turn(
+    blackboard: py_trees.blackboard.Client,
+) -> None:
+    """Clear transient state for one conversational turn.
+
+    Deliberately does not change:
+      * DIALOGUE_CONVERSATION_ACTIVE
+      * AUDIO_DESIRED_MODE
+
+    Those two values describe the lifetime of the conversation, not an
+    individual utterance.
+    """
+
+    blackboard.set(
+        BlackboardKey.DIALOGUE_COMMAND,
+        "",
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.DIALOGUE_INTENT,
+        Intent.NONE,
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.DIALOGUE_INTENT_CONFIDENCE,
+        0.0,
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+        "",
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.DIALOGUE_STOP_LISTENING_REQUESTED,
+        False,
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.DIALOGUE_STATE,
+        DialogueState.IDLE,
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.DIALOGUE_ERROR,
+        "",
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.AUDIO_HEARD_TEXT,
+        "",
+        overwrite=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Generic shell behaviours
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class PlaceholderResult:
@@ -96,8 +189,12 @@ class BlackboardEquals(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.FAILURE
 
 
+# ---------------------------------------------------------------------------
+# ROS -> blackboard event bridge
+# ---------------------------------------------------------------------------
+
 class ProcessAudioEvents(py_trees.behaviour.Behaviour):
-    """Receive ROS audio events and reflect them onto the K9 blackboard."""
+    """Receive ROS audio/dialogue events and reflect them onto the blackboard."""
 
     def __init__(self, node: Node) -> None:
         super().__init__(name="Process Audio Events")
@@ -109,16 +206,30 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
             namespace="k9",
         )
 
+        # Audio event/state fields.
         for key in [
             BlackboardKey.AUDIO_HOTWORD_DETECTED,
             BlackboardKey.AUDIO_IS_LISTENING,
+            BlackboardKey.AUDIO_IS_TALKING,
             BlackboardKey.AUDIO_HEARD_TEXT,
             BlackboardKey.AUDIO_LAST_EVENT,
         ]:
-            self.blackboard.register_key(
-                key=key,
-                access=py_trees.common.Access.WRITE,
-            )
+            register_read_write(self.blackboard, key)
+
+        # Dialogue fields populated atomically from IntentResult.
+        for key in [
+            BlackboardKey.DIALOGUE_COMMAND,
+            BlackboardKey.DIALOGUE_INTENT,
+            BlackboardKey.DIALOGUE_INTENT_CONFIDENCE,
+            BlackboardKey.DIALOGUE_STOP_LISTENING_REQUESTED,
+            BlackboardKey.DIALOGUE_STATE,
+        ]:
+            register_read_write(self.blackboard, key)
+
+        self.blackboard.register_key(
+            key=BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            access=py_trees.common.Access.READ,
+        )
 
         self.hotword_subscription = node.create_subscription(
             Bool,
@@ -141,20 +252,36 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
             10,
         )
 
-    def _hotword_callback(self, msg: Bool) -> None:
-        # Treat True as an event and latch it until a BT behaviour consumes it.
-        if msg.data:
-            self.blackboard.set(
-                BlackboardKey.AUDIO_HOTWORD_DETECTED,
-                True,
-                overwrite=True,
-            )
+        self.intent_subscription = node.create_subscription(
+            IntentResult,
+            "/intent/result",
+            self._intent_callback,
+            10,
+        )
 
-            self.blackboard.set(
-                BlackboardKey.AUDIO_LAST_EVENT,
-                "HOTWORD_DETECTED",
-                overwrite=True,
-            )
+        # This is what makes the audio manager's Talking Override real.
+        self.voice_talking_subscription = node.create_subscription(
+            Bool,
+            "/voice/is_talking",
+            self._voice_talking_callback,
+            10,
+        )
+
+    def _hotword_callback(self, msg: Bool) -> None:
+        # Treat True as an event and latch it until BeginConversation consumes it.
+        if not msg.data:
+            return
+
+        self.blackboard.set(
+            BlackboardKey.AUDIO_HOTWORD_DETECTED,
+            True,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.AUDIO_LAST_EVENT,
+            "HOTWORD_DETECTED",
+            overwrite=True,
+        )
 
     def _stt_state_callback(self, msg: String) -> None:
         state = msg.data.strip().lower()
@@ -171,6 +298,11 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
         )
 
     def _stt_text_callback(self, msg: String) -> None:
+        """Record raw STT text for diagnostics only.
+
+        The dialogue manager deliberately does NOT act on this field.  It waits
+        for /intent/result so STOP_LISTENING cannot race the repeat-back path.
+        """
         text = msg.data.strip()
 
         if not text:
@@ -181,17 +313,82 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
             text,
             overwrite=True,
         )
-
         self.blackboard.set(
             BlackboardKey.AUDIO_LAST_EVENT,
             "UTTERANCE_RECEIVED",
             overwrite=True,
         )
 
+    def _intent_callback(self, msg: IntentResult) -> None:
+        """Commit one complete interpreted utterance to the dialogue manager."""
+
+        text = msg.text.strip()
+        intent = msg.intent.strip().upper() or Intent.NONE
+
+        if not text:
+            return
+
+        # Ignore stray/stale intent results outside a conversation.
+        if not self.blackboard.get(
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
+        ):
+            self.node.get_logger().debug(
+                f"Ignoring intent outside active conversation: "
+                f"{intent} / {text!r}"
+            )
+            return
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_COMMAND,
+            text,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_INTENT,
+            intent,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_INTENT_CONFIDENCE,
+            float(msg.confidence),
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_STOP_LISTENING_REQUESTED,
+            intent == Intent.STOP_LISTENING,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_STATE,
+            DialogueState.PROCESSING,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.AUDIO_LAST_EVENT,
+            "INTENT_RECEIVED",
+            overwrite=True,
+        )
+
+        self.node.get_logger().info(
+            f"Intent received: {intent} "
+            f"({float(msg.confidence):.2f}) / {text!r}"
+        )
+
+    def _voice_talking_callback(self, msg: Bool) -> None:
+        self.blackboard.set(
+            BlackboardKey.AUDIO_IS_TALKING,
+            bool(msg.data),
+            overwrite=True,
+        )
+
     def update(self) -> py_trees.common.Status:
-        self.feedback_message = "monitoring ROS audio events"
+        self.feedback_message = "monitoring ROS audio/dialogue events"
         return py_trees.common.Status.RUNNING
 
+
+# ---------------------------------------------------------------------------
+# Audio state arbitration
+# ---------------------------------------------------------------------------
 
 class MaintainAudioMode(py_trees.behaviour.Behaviour):
     """Maintain one effective audio mode and publish it to ROS."""
@@ -211,9 +408,9 @@ class MaintainAudioMode(py_trees.behaviour.Behaviour):
             name=name,
             namespace="k9",
         )
-        self.blackboard.register_key(
-            key=BlackboardKey.AUDIO_EFFECTIVE_MODE,
-            access=py_trees.common.Access.WRITE,
+        register_read_write(
+            self.blackboard,
+            BlackboardKey.AUDIO_EFFECTIVE_MODE,
         )
 
         self.publisher = node.create_publisher(
@@ -238,70 +435,210 @@ class MaintainAudioMode(py_trees.behaviour.Behaviour):
                 f"Effective audio state: {current} -> {self.mode}"
             )
 
-        # Deliberately publish every BT tick.
-        #
-        # This means a hotword/STT node that restarts will quickly receive
-        # the current effective state even though the ROS topic is volatile.
+        # Publish every BT tick.  A hotword/STT node which restarts therefore
+        # quickly receives the current state even though the topic is volatile.
         self.publisher.publish(String(data=self.mode))
 
         self.feedback_message = f"maintaining {self.mode}"
-
         return py_trees.common.Status.RUNNING
 
 
-class HandleHotwordDetected(py_trees.behaviour.Behaviour):
-    """Convert a latched hotword event into a request to listen."""
+# ---------------------------------------------------------------------------
+# Persistent conversation leaves
+# ---------------------------------------------------------------------------
 
-    def __init__(self) -> None:
-        super().__init__(name="Handle Hotword Detected")
+class WaitForHotword(py_trees.behaviour.Behaviour):
+    """SUCCESS when a latched hotword event is ready to be consumed."""
 
-        self.blackboard = py_trees.blackboard.Client(
-            name="Handle Hotword Detected",
+    def __init__(self, name: str = "Wait For Hotword") -> None:
+        super().__init__(name=name)
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
             namespace="k9",
         )
-
         self.blackboard.register_key(
             key=BlackboardKey.AUDIO_HOTWORD_DETECTED,
             access=py_trees.common.Access.READ,
         )
-        self.blackboard.register_key(
-            key=BlackboardKey.AUDIO_HOTWORD_DETECTED,
-            access=py_trees.common.Access.WRITE,
-        )
-        self.blackboard.register_key(
-            key=BlackboardKey.AUDIO_DESIRED_MODE,
-            access=py_trees.common.Access.WRITE,
-        )
 
     def update(self) -> py_trees.common.Status:
-        detected = self.blackboard.get(
-            BlackboardKey.AUDIO_HOTWORD_DETECTED
+        detected = bool(
+            self.blackboard.get(
+                BlackboardKey.AUDIO_HOTWORD_DETECTED
+            )
         )
 
-        if not detected:
-            self.feedback_message = "no hotword pending"
-            return py_trees.common.Status.FAILURE
+        if detected:
+            self.feedback_message = "hotword pending"
+            return py_trees.common.Status.SUCCESS
 
+        self.feedback_message = "waiting for hotword"
+        return py_trees.common.Status.FAILURE
+
+
+class BeginConversation(py_trees.behaviour.Behaviour):
+    """Consume the hotword and enter persistent LISTENING mode."""
+
+    def __init__(self, name: str = "Begin Conversation") -> None:
+        super().__init__(name=name)
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        for key in [
+            BlackboardKey.AUDIO_HOTWORD_DETECTED,
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            BlackboardKey.DIALOGUE_COMMAND,
+            BlackboardKey.DIALOGUE_INTENT,
+            BlackboardKey.DIALOGUE_INTENT_CONFIDENCE,
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+            BlackboardKey.DIALOGUE_STOP_LISTENING_REQUESTED,
+            BlackboardKey.DIALOGUE_STATE,
+            BlackboardKey.DIALOGUE_ERROR,
+            BlackboardKey.AUDIO_HEARD_TEXT,
+        ]:
+            register_read_write(self.blackboard, key)
+
+    def update(self) -> py_trees.common.Status:
+        # Clear anything left from the previous conversation before activating
+        # the new one.
+        clear_dialogue_turn(self.blackboard)
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            True,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            AudioMode.LISTENING,
+            overwrite=True,
+        )
         self.blackboard.set(
             BlackboardKey.AUDIO_HOTWORD_DETECTED,
             False,
             overwrite=True,
         )
 
-        self.blackboard.set(
-            BlackboardKey.AUDIO_DESIRED_MODE,
-            AudioMode.LISTENING,
-            overwrite=True,
-        )
-
-        self.feedback_message = "requested LISTENING"
-
+        self.feedback_message = "conversation active; requested LISTENING"
         return py_trees.common.Status.SUCCESS
 
 
-class HandleUtteranceReceived(py_trees.behaviour.Behaviour):
+class ConversationActive(py_trees.behaviour.Behaviour):
+    """SUCCESS while the persistent conversation is active."""
 
-    def __init__(self, name="Handle Utterance Received"):
+    def __init__(self, name: str = "Conversation Active?") -> None:
+        super().__init__(name=name)
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+        self.blackboard.register_key(
+            key=BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            access=py_trees.common.Access.READ,
+        )
+
+    def update(self) -> py_trees.common.Status:
+        active = bool(
+            self.blackboard.get(
+                BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
+            )
+        )
+
+        self.feedback_message = (
+            "conversation active" if active else "conversation inactive"
+        )
+
+        if active:
+            return py_trees.common.Status.SUCCESS
+
+        return py_trees.common.Status.FAILURE
+
+
+class WaitForCommand(py_trees.behaviour.Behaviour):
+    """Wait for the intent node to provide a complete interpreted utterance."""
+
+    def __init__(self, name: str = "Wait For Interpreted Utterance") -> None:
+        super().__init__(name=name)
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+        self.blackboard.register_key(
+            key=BlackboardKey.DIALOGUE_COMMAND,
+            access=py_trees.common.Access.READ,
+        )
+        self.blackboard.register_key(
+            key=BlackboardKey.DIALOGUE_INTENT,
+            access=py_trees.common.Access.READ,
+        )
+
+    def update(self) -> py_trees.common.Status:
+        command = self.blackboard.get(
+            BlackboardKey.DIALOGUE_COMMAND
+        ).strip()
+
+        if not command:
+            self.feedback_message = "waiting for /intent/result"
+            return py_trees.common.Status.RUNNING
+
+        intent = self.blackboard.get(
+            BlackboardKey.DIALOGUE_INTENT
+        )
+        self.feedback_message = f"{intent}: {command}"
+        return py_trees.common.Status.SUCCESS
+
+
+class IsIntent(py_trees.behaviour.Behaviour):
+    """SUCCESS when the current dialogue intent equals the requested intent."""
+
+    def __init__(
+        self,
+        expected_intent: str,
+        name: str | None = None,
+    ) -> None:
+        super().__init__(
+            name=name or f"Intent = {expected_intent}?"
+        )
+
+        self.expected_intent = expected_intent
+
+        self.blackboard = self.attach_blackboard_client(
+            name=self.name,
+            namespace="k9",
+        )
+        self.blackboard.register_key(
+            key=BlackboardKey.DIALOGUE_INTENT,
+            access=py_trees.common.Access.READ,
+        )
+
+    def update(self) -> py_trees.common.Status:
+        actual = self.blackboard.get(
+            BlackboardKey.DIALOGUE_INTENT
+        )
+
+        self.feedback_message = (
+            f"{actual} "
+            f"{'==' if actual == self.expected_intent else '!='} "
+            f"{self.expected_intent}"
+        )
+
+        if actual == self.expected_intent:
+            return py_trees.common.Status.SUCCESS
+
+        return py_trees.common.Status.FAILURE
+
+
+class GenerateRepeatBack(py_trees.behaviour.Behaviour):
+    """Build the temporary repeat-back response for a normal utterance."""
+
+    def __init__(self, name: str = "Generate Repeat Back") -> None:
         super().__init__(name=name)
 
         self.blackboard = self.attach_blackboard_client(
@@ -310,69 +647,53 @@ class HandleUtteranceReceived(py_trees.behaviour.Behaviour):
         )
 
         self.blackboard.register_key(
-            key=BlackboardKey.AUDIO_HEARD_TEXT,
-            access=py_trees.common.Access.WRITE,
-        )
-
-        self.blackboard.register_key(
-            key=BlackboardKey.AUDIO_DESIRED_MODE,
-            access=py_trees.common.Access.WRITE,
-        )
-
-        self.blackboard.register_key(
             key=BlackboardKey.DIALOGUE_COMMAND,
-            access=py_trees.common.Access.WRITE,
+            access=py_trees.common.Access.READ,
+        )
+        register_read_write(
+            self.blackboard,
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+        )
+        register_read_write(
+            self.blackboard,
+            BlackboardKey.DIALOGUE_STATE,
         )
 
-        self.blackboard.register_key(
-            key=BlackboardKey.DIALOGUE_PENDING_RESPONSE,
-            access=py_trees.common.Access.WRITE,
-        )
-
-    def update(self):
-
+    def update(self) -> py_trees.common.Status:
         text = self.blackboard.get(
-            BlackboardKey.AUDIO_HEARD_TEXT
+            BlackboardKey.DIALOGUE_COMMAND
         ).strip()
 
         if not text:
+            self.feedback_message = "no command to repeat"
             return py_trees.common.Status.FAILURE
 
-        # Preserve what the user said for the dialogue manager.
-        self.blackboard.set(
-            BlackboardKey.DIALOGUE_COMMAND,
-            text,
-            overwrite=True,
-        )
+        response = f"Affirmative. I heard you say {text}"
 
-        # For this first end-to-end test, generate a simple response.
         self.blackboard.set(
             BlackboardKey.DIALOGUE_PENDING_RESPONSE,
-            f"Affirmative. I heard you say {text}",
+            response,
             overwrite=True,
         )
-
-        # The utterance is now consumed.
         self.blackboard.set(
-            BlackboardKey.AUDIO_HEARD_TEXT,
-            "",
+            BlackboardKey.DIALOGUE_STATE,
+            DialogueState.WAITING_TO_SPEAK,
             overwrite=True,
         )
 
-        # Stop STT while we formulate/speak the response.
-        self.blackboard.set(
-            BlackboardKey.AUDIO_DESIRED_MODE,
-            AudioMode.NOT_LISTENING,
-            overwrite=True,
-        )
-
-        self.feedback_message = f"consumed: {text}"
-
+        self.feedback_message = response
         return py_trees.common.Status.SUCCESS
 
-class SpeakPendingResponse(py_trees.behaviour.Behaviour):
 
-    def __init__(self, *, node, name="Speak Pending Response"):
+class SpeakPendingResponse(py_trees.behaviour.Behaviour):
+    """Speak the pending dialogue response using the priority action server."""
+
+    def __init__(
+        self,
+        *,
+        node: Node,
+        name: str = "Speak Pending Response",
+    ) -> None:
         super().__init__(name=name)
 
         self.node = node
@@ -390,12 +711,15 @@ class SpeakPendingResponse(py_trees.behaviour.Behaviour):
 
         self.blackboard.register_key(
             key=BlackboardKey.DIALOGUE_PENDING_RESPONSE,
-            access=py_trees.common.Access.WRITE,
+            access=py_trees.common.Access.READ,
         )
-
-        self.blackboard.register_key(
-            key=BlackboardKey.AUDIO_DESIRED_MODE,
-            access=py_trees.common.Access.WRITE,
+        register_read_write(
+            self.blackboard,
+            BlackboardKey.DIALOGUE_STATE,
+        )
+        register_read_write(
+            self.blackboard,
+            BlackboardKey.DIALOGUE_ERROR,
         )
 
         self.goal_future = None
@@ -403,8 +727,7 @@ class SpeakPendingResponse(py_trees.behaviour.Behaviour):
         self.result_future = None
         self.response_text = ""
 
-    def initialise(self):
-
+    def initialise(self) -> None:
         self.goal_future = None
         self.goal_handle = None
         self.result_future = None
@@ -414,6 +737,7 @@ class SpeakPendingResponse(py_trees.behaviour.Behaviour):
         ).strip()
 
         if not self.response_text:
+            self.feedback_message = "no pending response"
             return
 
         if not self.client.server_is_ready():
@@ -421,7 +745,6 @@ class SpeakPendingResponse(py_trees.behaviour.Behaviour):
             return
 
         goal = SpeakText.Goal()
-
         goal.text = self.response_text
         goal.owner = "dialogue"
         goal.priority = 100
@@ -429,73 +752,191 @@ class SpeakPendingResponse(py_trees.behaviour.Behaviour):
         goal.clear_lower_priority = True
 
         self.goal_future = self.client.send_goal_async(goal)
-
         self.feedback_message = "speech goal submitted"
 
-    def update(self):
-
+    def update(self) -> py_trees.common.Status:
         if not self.response_text:
             return py_trees.common.Status.FAILURE
 
         if self.goal_future is None:
-            self.feedback_message = "voice server unavailable"
+            # Returning FAILURE lets the conversation sequence retry on a later
+            # BT tick without losing the command or pending response.
+            self.feedback_message = "voice action server unavailable"
             return py_trees.common.Status.FAILURE
 
-        #
-        # Waiting for voice server to accept goal
-        #
-
+        # Waiting for the action server to accept the goal.
         if self.goal_handle is None:
-
             if not self.goal_future.done():
                 self.feedback_message = "waiting for speech goal acceptance"
                 return py_trees.common.Status.RUNNING
 
-            self.goal_handle = self.goal_future.result()
+            try:
+                self.goal_handle = self.goal_future.result()
+            except Exception as exc:  # rclpy future exception
+                self.blackboard.set(
+                    BlackboardKey.DIALOGUE_ERROR,
+                    f"speech goal failed: {exc}",
+                    overwrite=True,
+                )
+                self.feedback_message = f"speech goal failed: {exc}"
+                return py_trees.common.Status.FAILURE
 
-            if not self.goal_handle.accepted:
+            if self.goal_handle is None or not self.goal_handle.accepted:
                 self.feedback_message = "speech goal rejected"
                 return py_trees.common.Status.FAILURE
 
             self.result_future = self.goal_handle.get_result_async()
 
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_STATE,
+                DialogueState.SPEAKING,
+                overwrite=True,
+            )
+
             self.feedback_message = "speaking"
             return py_trees.common.Status.RUNNING
 
-        #
-        # Voice is still speaking
-        #
-
-        if not self.result_future.done():
+        # Voice is still speaking.
+        if self.result_future is None or not self.result_future.done():
             self.feedback_message = "speaking"
             return py_trees.common.Status.RUNNING
 
-        #
-        # Speech completed
-        #
-
-        result = self.result_future.result().result
+        # Speech completed.
+        try:
+            wrapped_result = self.result_future.result()
+            result = wrapped_result.result
+        except Exception as exc:  # rclpy future exception
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_ERROR,
+                f"speech result failed: {exc}",
+                overwrite=True,
+            )
+            self.feedback_message = f"speech result failed: {exc}"
+            return py_trees.common.Status.FAILURE
 
         if not result.success:
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_ERROR,
+                result.message,
+                overwrite=True,
+            )
             self.feedback_message = result.message
             return py_trees.common.Status.FAILURE
 
-        self.blackboard.set(
+        # Do NOT return to WAITING_FOR_HOTWORD here.  The conversation is still
+        # active and AUDIO_DESIRED_MODE remains LISTENING.
+        self.feedback_message = "speech complete; resume conversation"
+        return py_trees.common.Status.SUCCESS
+
+
+class ClearConversationTurn(py_trees.behaviour.Behaviour):
+    """Finish one normal turn and remain in the active conversation."""
+
+    def __init__(self, name: str = "Clear Conversation Turn") -> None:
+        super().__init__(name=name)
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        for key in [
+            BlackboardKey.DIALOGUE_COMMAND,
+            BlackboardKey.DIALOGUE_INTENT,
+            BlackboardKey.DIALOGUE_INTENT_CONFIDENCE,
             BlackboardKey.DIALOGUE_PENDING_RESPONSE,
-            "",
+            BlackboardKey.DIALOGUE_STOP_LISTENING_REQUESTED,
+            BlackboardKey.DIALOGUE_STATE,
+            BlackboardKey.DIALOGUE_ERROR,
+            BlackboardKey.AUDIO_HEARD_TEXT,
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+        ]:
+            register_read_write(self.blackboard, key)
+
+    def update(self) -> py_trees.common.Status:
+        clear_dialogue_turn(self.blackboard)
+
+        # Be explicit about the invariant for the test:
+        # a successfully completed normal turn always goes back to listening.
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            True,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            AudioMode.LISTENING,
             overwrite=True,
         )
 
+        self.feedback_message = "turn cleared; still LISTENING"
+        return py_trees.common.Status.SUCCESS
+
+
+class EndConversation(py_trees.behaviour.Behaviour):
+    """End the conversation only after an explicit STOP_LISTENING intent."""
+
+    def __init__(self, name: str = "End Conversation") -> None:
+        super().__init__(name=name)
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        for key in [
+            BlackboardKey.DIALOGUE_COMMAND,
+            BlackboardKey.DIALOGUE_INTENT,
+            BlackboardKey.DIALOGUE_INTENT_CONFIDENCE,
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+            BlackboardKey.DIALOGUE_STOP_LISTENING_REQUESTED,
+            BlackboardKey.DIALOGUE_STATE,
+            BlackboardKey.DIALOGUE_ERROR,
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            BlackboardKey.AUDIO_HEARD_TEXT,
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            BlackboardKey.AUDIO_LAST_EVENT,
+        ]:
+            register_read_write(self.blackboard, key)
+
+    def update(self) -> py_trees.common.Status:
+        clear_dialogue_turn(self.blackboard)
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            False,
+            overwrite=True,
+        )
         self.blackboard.set(
             BlackboardKey.AUDIO_DESIRED_MODE,
             AudioMode.WAITING_FOR_HOTWORD,
             overwrite=True,
         )
+        self.blackboard.set(
+            BlackboardKey.AUDIO_LAST_EVENT,
+            "CONVERSATION_ENDED",
+            overwrite=True,
+        )
 
-        self.feedback_message = "speech complete"
-
+        self.feedback_message = "STOP_LISTENING; waiting for hotword"
         return py_trees.common.Status.SUCCESS
 
+
+class DialogueIdle(py_trees.behaviour.Behaviour):
+    """Visible idle leaf used while waiting for the next hotword."""
+
+    def __init__(self, name: str = "Dialogue Idle") -> None:
+        super().__init__(name=name)
+
+    def update(self) -> py_trees.common.Status:
+        self.feedback_message = "waiting for hotword"
+        return py_trees.common.Status.RUNNING
+
+
+# ---------------------------------------------------------------------------
+# Shell helper constructors
+# ---------------------------------------------------------------------------
 
 RUNNING = PlaceholderResult(
     status=py_trees.common.Status.RUNNING,
@@ -547,11 +988,18 @@ def parallel(name: str) -> py_trees.composites.Parallel:
         ),
     )
 
+
+# ---------------------------------------------------------------------------
+# Subtrees
+# ---------------------------------------------------------------------------
+
 def create_audio_state_manager(
     node: Node,
 ) -> py_trees.behaviour.Behaviour:
     process_audio_events = ProcessAudioEvents(node)
 
+    # Highest priority: while the voice node says K9 is talking, force the
+    # effective mode away from STT regardless of the persistent desired mode.
     talking_override = sequence("Talking Override")
     talking_override.add_children(
         [
@@ -627,21 +1075,87 @@ def create_audio_state_manager(
     return audio_state_manager
 
 
+def create_dialogue_manager(
+    node: Node,
+) -> py_trees.behaviour.Behaviour:
+    """Build the persistent hotword -> conversation -> stop loop."""
 
-def create_dialogue_manager(node) -> py_trees.behaviour.Behaviour:
-    dialogue_manager = selector("Dialogue Manager")
-    dialogue_manager.add_children(
+    # STOP_LISTENING is checked before normal repeat-back, so the stop command
+    # itself is not spoken back to the user.
+    stop_conversation = py_trees.composites.Sequence(
+        name="Stop Conversation",
+        memory=True,
+    )
+    stop_conversation.add_children(
         [
-            HandleHotwordDetected(),
-            HandleUtteranceReceived(),
-            no_work("Handle StopListening Intent"),
-            no_work("Handle PlayChess Intent"),
-            no_work("Handle Chess Setup Answer"),
-            no_work("Handle General Conversation"),
-            SpeakPendingResponse(node=node),
-            running("Dialogue Idle"),
+            IsIntent(Intent.STOP_LISTENING),
+            EndConversation(),
         ]
     )
+
+    # One ordinary conversational turn.  Memory is required so a RUNNING
+    # action goal does not re-run GenerateRepeatBack on every BT tick.
+    repeat_back = py_trees.composites.Sequence(
+        name="Repeat Back",
+        memory=True,
+    )
+    repeat_back.add_children(
+        [
+            GenerateRepeatBack(),
+            SpeakPendingResponse(node=node),
+            ClearConversationTurn(),
+        ]
+    )
+
+    handle_turn = py_trees.composites.Selector(
+        name="Handle Conversation Turn",
+        memory=True,
+    )
+    handle_turn.add_children(
+        [
+            stop_conversation,
+            repeat_back,
+        ]
+    )
+
+    # While a conversation is active this branch remains RUNNING in
+    # WaitForCommand, then handles exactly one interpreted utterance.
+    conversation = py_trees.composites.Sequence(
+        name="Active Conversation",
+        memory=True,
+    )
+    conversation.add_children(
+        [
+            ConversationActive(),
+            WaitForCommand(),
+            handle_turn,
+        ]
+    )
+
+    # This branch is only reached when no conversation is active.
+    start_conversation = py_trees.composites.Sequence(
+        name="Start Conversation",
+        memory=True,
+    )
+    start_conversation.add_children(
+        [
+            WaitForHotword(),
+            BeginConversation(),
+        ]
+    )
+
+    dialogue_manager = py_trees.composites.Selector(
+        name="Dialogue Manager",
+        memory=False,
+    )
+    dialogue_manager.add_children(
+        [
+            conversation,
+            start_conversation,
+            DialogueIdle(),
+        ]
+    )
+
     return dialogue_manager
 
 
@@ -724,6 +1238,10 @@ def create_tree(node: Node) -> py_trees.behaviour.Behaviour:
     return root
 
 
+# ---------------------------------------------------------------------------
+# ROS node
+# ---------------------------------------------------------------------------
+
 class K9BehaviourTreeShell(Node):
     """ROS 2 custodian for the K9 behaviour-tree and shared blackboard."""
 
@@ -738,7 +1256,6 @@ class K9BehaviourTreeShell(Node):
             raise ValueError("tick_period_ms must be greater than zero")
 
         # Create and initialise the central /k9 blackboard before the tree ticks.
-        # The wrapper provides canonical keys and lightweight type checking.
         self.blackboard = K9Blackboard()
         self.blackboard.set(
             BlackboardKey.SYSTEM_STATUS,
@@ -747,8 +1264,6 @@ class K9BehaviourTreeShell(Node):
 
         root = create_tree(self)
 
-        # py_trees_ros adds snapshot-stream services and blackboard
-        # introspection around the ordinary py_trees hierarchy.
         self.tree = py_trees_ros.trees.BehaviourTree(
             root=root,
             unicode_tree_debug=False,
@@ -758,8 +1273,6 @@ class K9BehaviourTreeShell(Node):
             timeout=15.0,
         )
 
-        # Keep a predictable snapshot topic available as well as the dynamic
-        # snapshot-stream services used by the viewer.
         parameter_results = self.set_parameters(
             [
                 Parameter(
@@ -811,6 +1324,9 @@ class K9BehaviourTreeShell(Node):
             f"Tick period: {tick_period_ms:.0f} ms"
         )
         self.get_logger().info(
+            "Conversation test: persistent LISTENING until STOP_LISTENING"
+        )
+        self.get_logger().info(
             "Tree snapshots: /k9_bt_shell/snapshots"
         )
         self.get_logger().info(
@@ -839,7 +1355,10 @@ def main(args=None) -> None:
                 BlackboardKey.SYSTEM_STATUS,
                 "STOPPED",
             )
-            node.tree.shutdown(destroy_node=False)
+
+            # Your installed py_trees_ros BehaviourTree.shutdown() does not
+            # accept destroy_node=False.
+            node.tree.shutdown()
             node.destroy_node()
 
         if rclpy.ok():
