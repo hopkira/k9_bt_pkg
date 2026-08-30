@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import threading
 import py_trees
 import py_trees_ros
 import rclpy
@@ -42,8 +43,10 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
 from k9_interfaces_pkg.action import SpeakText
-from k9_interfaces_pkg.msg import IntentResult
-
+from k9_interfaces_pkg.msg import (
+    IntentResult,
+    RecognisedFaceArray,
+)
 try:
     # Normal installed-package / ros2 run path.
     from k9_bt_pkg.k9_blackboard import (
@@ -480,6 +483,300 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
         self.feedback_message = "monitoring ROS audio/dialogue events"
         return py_trees.common.Status.RUNNING
 
+class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
+    """Bridge recognised-face ROS state into the K9 blackboard."""
+
+    def __init__(self, node: Node) -> None:
+        super().__init__(name="Process Perception Events")
+
+        self.node = node
+
+        # The ROS callback writes only to this local cache.
+        # Blackboard changes are made synchronously from update().
+        self._lock = threading.Lock()
+        self._latest_faces = {}
+        self._new_message = False
+
+        # Previous state is retained so that transitions can be derived.
+        self._previous_faces = {}
+
+        self.blackboard = py_trees.blackboard.Client(
+            name="Process Perception Events",
+            namespace="k9",
+        )
+
+        for key in [
+            BlackboardKey.PERCEPTION_PERSON_COUNT,
+            BlackboardKey.PERCEPTION_PERSON_VISIBLE,
+            BlackboardKey.PERCEPTION_KNOWN_PERSON_VISIBLE,
+            BlackboardKey.PERCEPTION_VISIBLE_TRACK_IDS,
+            BlackboardKey.PERCEPTION_VISIBLE_IDENTITIES,
+            BlackboardKey.PERCEPTION_LAST_EVENT,
+            BlackboardKey.PERCEPTION_EVENT_TRACK_ID,
+            BlackboardKey.PERCEPTION_EVENT_IDENTITY,
+            BlackboardKey.PERCEPTION_ERROR,
+        ]:
+            register_read_write(
+                self.blackboard,
+                key,
+            )
+
+        self.subscription = node.create_subscription(
+            RecognisedFaceArray,
+            "/k9/perception/recognised_faces",
+            self._faces_callback,
+            10,
+        )
+
+    def _faces_callback(
+        self,
+        msg: RecognisedFaceArray,
+    ) -> None:
+        """Cache the latest recognition state.
+
+        Do not mutate the BT blackboard from the asynchronous ROS callback.
+        """
+
+        faces = {}
+
+        for face in msg.faces:
+            track_id = int(
+                face.track_id
+            )
+
+            faces[track_id] = {
+                "recognised": bool(
+                    face.recognised
+                ),
+                "identity": (
+                    face.identity.strip()
+                    if face.recognised
+                    else ""
+                ),
+                "confidence": float(
+                    face.recognition_confidence
+                ),
+            }
+
+        with self._lock:
+            self._latest_faces = faces
+            self._new_message = True
+
+    def _set_event(
+        self,
+        event: str,
+        track_id: int,
+        identity: str = "",
+    ) -> None:
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_LAST_EVENT,
+            event,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_EVENT_TRACK_ID,
+            track_id,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_EVENT_IDENTITY,
+            identity,
+            overwrite=True,
+        )
+
+    def update(self) -> py_trees.common.Status:
+
+        # Events last for one BT tick unless a new transition occurs.
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_LAST_EVENT,
+            "",
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_EVENT_TRACK_ID,
+            0,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_EVENT_IDENTITY,
+            "",
+            overwrite=True,
+        )
+
+        with self._lock:
+            if not self._new_message:
+                self.feedback_message = (
+                    "no new perception message"
+                )
+                return py_trees.common.Status.RUNNING
+
+            current_faces = dict(
+                self._latest_faces
+            )
+
+            self._new_message = False
+
+        previous_faces = self._previous_faces
+
+        current_ids = set(
+            current_faces.keys()
+        )
+
+        previous_ids = set(
+            previous_faces.keys()
+        )
+
+        # --------------------------------------------------------
+        # Persistent world state
+        # --------------------------------------------------------
+
+        visible_track_ids = sorted(
+            current_ids
+        )
+
+        visible_identities = sorted(
+            {
+                face["identity"]
+                for face in current_faces.values()
+                if (
+                    face["recognised"]
+                    and face["identity"]
+                )
+            }
+        )
+
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_PERSON_COUNT,
+            len(current_faces),
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_PERSON_VISIBLE,
+            bool(current_faces),
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_KNOWN_PERSON_VISIBLE,
+            bool(visible_identities),
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_VISIBLE_TRACK_IDS,
+            visible_track_ids,
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_VISIBLE_IDENTITIES,
+            visible_identities,
+            overwrite=True,
+        )
+
+        # --------------------------------------------------------
+        # Derive transitions
+        # --------------------------------------------------------
+
+        appeared = (
+            current_ids - previous_ids
+        )
+
+        disappeared = (
+            previous_ids - current_ids
+        )
+
+        event_generated = False
+
+        # First priority: completely new person/track.
+        if appeared:
+            track_id = min(
+                appeared
+            )
+
+            face = current_faces[
+                track_id
+            ]
+
+            self._set_event(
+                "PERSON_APPEARED",
+                track_id,
+                face["identity"],
+            )
+
+            event_generated = True
+
+        # Second priority: an existing unknown track has just
+        # become recognised.
+        if not event_generated:
+            for track_id in sorted(
+                current_ids & previous_ids
+            ):
+                current = current_faces[
+                    track_id
+                ]
+                previous = previous_faces[
+                    track_id
+                ]
+
+                if (
+                    current["recognised"]
+                    and
+                    not previous["recognised"]
+                ):
+                    self._set_event(
+                        "KNOWN_PERSON_APPEARED",
+                        track_id,
+                        current["identity"],
+                    )
+
+                    event_generated = True
+                    break
+
+        # Third priority: somebody left.
+        if (
+            not event_generated
+            and disappeared
+        ):
+            track_id = min(
+                disappeared
+            )
+
+            previous = previous_faces[
+                track_id
+            ]
+
+            event = (
+                "KNOWN_PERSON_LEFT"
+                if previous["recognised"]
+                else "PERSON_LEFT"
+            )
+
+            self._set_event(
+                event,
+                track_id,
+                previous["identity"],
+            )
+
+        self._previous_faces = (
+            current_faces
+        )
+
+        if visible_identities:
+            self.feedback_message = (
+                f"{len(current_faces)} visible: "
+                + ", ".join(
+                    visible_identities
+                )
+            )
+        else:
+            self.feedback_message = (
+                f"{len(current_faces)} visible; "
+                "none recognised"
+            )
+
+        return py_trees.common.Status.RUNNING
 
 # ---------------------------------------------------------------------------
 # Audio state arbitration
@@ -1295,6 +1592,14 @@ def create_audio_state_manager(
     return audio_state_manager
 
 
+def create_perception_state_manager(
+    node: Node,
+) -> py_trees.behaviour.Behaviour:
+    return ProcessPerceptionEvents(node)
+
+    return perception_manager
+
+
 def create_dialogue_manager(
     node: Node,
 ) -> py_trees.behaviour.Behaviour:
@@ -1453,6 +1758,7 @@ def create_tree(node: Node) -> py_trees.behaviour.Behaviour:
     normal_operation.add_children(
         [
             create_audio_state_manager(node),
+            create_perception_state_manager(node),
             create_dialogue_manager(node),
             create_chess_manager(),
             create_expression_manager(),

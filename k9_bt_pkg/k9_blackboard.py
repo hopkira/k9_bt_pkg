@@ -120,6 +120,23 @@ class BlackboardKey:
     AUDIO_LAST_EVENT = "audio/last_event"
     AUDIO_ERROR = "audio/error"
 
+    # Perception and social awareness
+    PERCEPTION_PERSON_COUNT = "perception/person_count"
+    PERCEPTION_PERSON_VISIBLE = "perception/person_visible"
+    PERCEPTION_KNOWN_PERSON_VISIBLE = "perception/known_person_visible"
+
+    PERCEPTION_VISIBLE_TRACK_IDS = "perception/visible_track_ids"
+    PERCEPTION_VISIBLE_IDENTITIES = "perception/visible_identities"
+
+    PERCEPTION_LAST_EVENT = "perception/last_event"
+    PERCEPTION_EVENT_TRACK_ID = "perception/event_track_id"
+    PERCEPTION_EVENT_IDENTITY = "perception/event_identity"
+
+    PERCEPTION_ATTENDED_TRACK = "perception/attended_track"
+    PERCEPTION_ATTENDED_PERSON = "perception/attended_person"
+
+    PERCEPTION_ERROR = "perception/error"
+
     # Dialogue and intent processing
     DIALOGUE_STATE = "dialogue/state"
     DIALOGUE_COMMAND = "dialogue/command"
@@ -322,6 +339,75 @@ K9_BLACKBOARD_FIELDS: tuple[BlackboardField, ...] = (
         "",
         "Most recent audio subsystem error.",
     ),
+
+    # Perception
+    BlackboardField(
+        BlackboardKey.PERCEPTION_PERSON_COUNT,
+        int,
+        0,
+        "Number of currently visible tracked faces.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_PERSON_VISIBLE,
+        bool,
+        False,
+        "True when at least one person is currently visible.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_KNOWN_PERSON_VISIBLE,
+        bool,
+        False,
+        "True when at least one visible person has been recognised.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_VISIBLE_TRACK_IDS,
+        list,
+        [],
+        "Track ids of currently visible people.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_VISIBLE_IDENTITIES,
+        list,
+        [],
+        "Names of currently visible recognised people.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_LAST_EVENT,
+        str,
+        "",
+        "Most recent perception transition event.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_EVENT_TRACK_ID,
+        int,
+        0,
+        "Track id associated with the most recent perception event.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_EVENT_IDENTITY,
+        str,
+        "",
+        "Identity associated with the most recent perception event.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_ATTENDED_TRACK,
+        int,
+        0,
+        "Track currently selected for social attention.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_ATTENDED_PERSON,
+        str,
+        "",
+        "Recognised identity currently selected for social attention.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_ERROR,
+        str,
+        "",
+        "Most recent perception integration error.",
+    ),
+
 
     # Dialogue
     BlackboardField(
