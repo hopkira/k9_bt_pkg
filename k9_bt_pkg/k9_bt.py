@@ -42,6 +42,12 @@ from rclpy.parameter import Parameter
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
+from rclpy.qos import (
+    QoSProfile,
+    QoSReliabilityPolicy,
+    QoSHistoryPolicy,
+)
+
 from k9_interfaces_pkg.action import SpeakText
 from k9_interfaces_pkg.msg import (
     IntentResult,
@@ -521,11 +527,17 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
                 key,
             )
 
+        perception_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=2,
+        )
+
         self.subscription = node.create_subscription(
             RecognisedFaceArray,
             "/k9/perception/recognised_faces",
             self._faces_callback,
-            10,
+            perception_qos,
         )
 
     def _faces_callback(
