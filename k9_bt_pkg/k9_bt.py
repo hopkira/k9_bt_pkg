@@ -16,11 +16,16 @@ This version implements the persistent LLM conversation loop:
         -> reset conversation history
         -> WAITING_FOR_HOTWORD
 
-The desired audio mode remains LISTENING for the lifetime of an active
-conversation. While K9 is physically speaking, /voice/is_talking temporarily
-forces the effective audio mode to NOT_LISTENING. When speech finishes, the
-effective mode therefore returns to LISTENING and the STT node begins a fresh
-listening session.
+The desired and effective audio modes remain LISTENING for the lifetime of an
+active conversation. PROCESSING and SPEAKING are temporary interaction
+activities published on /interaction/activity; the STT node inhibits recognition
+during those activities, so the persistent interaction mode does not need to
+change while K9 is thinking or speaking.
+
+The physical back panel publishes /interaction/mode_request with one of
+NOT_LISTENING, WAITING_FOR_HOTWORD, or LISTENING. Those requests are folded into
+the same AUDIO_DESIRED_MODE state used by the behaviour tree, so the panel
+remains a physical control surface rather than a parallel audio controller.
 
 Raw STT text is retained for diagnostics only. Dialogue sequencing waits for
 /intent/result so STOP_LISTENING cannot race the normal conversation path.
@@ -246,9 +251,13 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
         ]:
             register_read_write(self.blackboard, key)
 
-        self.blackboard.register_key(
-            key=BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
-            access=py_trees.common.Access.READ,
+        register_read_write(
+            self.blackboard,
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+        )
+        register_read_write(
+            self.blackboard,
+            BlackboardKey.AUDIO_DESIRED_MODE,
         )
 
         self.hotword_subscription = node.create_subscription(
@@ -286,12 +295,31 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
             10,
         )
 
-        # This is what makes the audio manager's Talking Override real.
+        # Voice state remains useful for diagnostics/blackboard visibility.
         self.voice_talking_subscription = node.create_subscription(
             Bool,
             "/voice/is_talking",
             self._voice_talking_callback,
             10,
+        )
+
+        # Physical back-panel requests are deliberately routed into the same
+        # persistent mode state used by the BT rather than controlling the
+        # hotword/STT nodes directly.
+        self.mode_request_subscription = node.create_subscription(
+            String,
+            "/interaction/mode_request",
+            self._mode_request_callback,
+            10,
+        )
+
+        # Ending a live conversation from the physical panel should have the
+        # same LLM-memory semantics as an explicit STOP_LISTENING intent.
+        # This reset is best-effort and asynchronous so a panel button can
+        # never block an audio-mode transition.
+        self.conversation_reset_client = node.create_client(
+            Trigger,
+            "/conversation/reset",
         )
 
     def _hotword_callback(self, msg: Bool) -> None:
@@ -484,6 +512,135 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
             bool(msg.data),
             overwrite=True,
         )
+
+    def _mode_request_callback(self, msg: String) -> None:
+        """Apply one debounced physical back-panel mode request.
+
+        LISTENING starts or maintains a persistent conversation without
+        requiring a hotword. WAITING_FOR_HOTWORD and NOT_LISTENING both end
+        any active conversation.
+
+        The callback only changes BT/blackboard state. MaintainAudioMode then
+        publishes the authoritative /audio/effective_state in the usual way.
+        """
+
+        value = msg.data.strip().upper()
+
+        aliases = {
+            "NOTLISTENING": AudioMode.NOT_LISTENING,
+            "NOT_LISTENING": AudioMode.NOT_LISTENING,
+            "WAITINGFORHOTWORD": AudioMode.WAITING_FOR_HOTWORD,
+            "WAITING_FOR_HOTWORD": AudioMode.WAITING_FOR_HOTWORD,
+            "LISTENING": AudioMode.LISTENING,
+        }
+
+        requested = aliases.get(value)
+
+        if requested is None:
+            self.node.get_logger().warning(
+                f"Ignoring unknown back-panel mode request: {msg.data!r}"
+            )
+            return
+
+        current = self.blackboard.get(
+            BlackboardKey.AUDIO_DESIRED_MODE
+        )
+
+        was_active = bool(
+            self.blackboard.get(
+                BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
+            )
+        )
+
+        conversation_active = (
+            requested == AudioMode.LISTENING
+        )
+
+        # LISTENING while conversation_active=False is not a no-op:
+        # the green button is the explicit "listen now" control.
+        if (
+            requested == current
+            and conversation_active == was_active
+        ):
+            return
+
+        # Discard any partially completed conversational turn before changing
+        # the persistent interaction mode.
+        clear_dialogue_turn(self.blackboard)
+
+        # A manual panel choice supersedes any previously latched hotword.
+        self.blackboard.set(
+            BlackboardKey.AUDIO_HOTWORD_DETECTED,
+            False,
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            conversation_active,
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            requested,
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.AUDIO_LAST_EVENT,
+            f"BACK_PANEL_MODE_{requested}",
+            overwrite=True,
+        )
+
+        self.node.get_logger().info(
+            f"Back-panel mode request: {current} -> {requested}; "
+            f"conversation_active={conversation_active}"
+        )
+
+        # A red/blue request that ends an active conversation should also
+        # discard its LLM history. Do this asynchronously and best-effort.
+        if (
+            was_active
+            and not conversation_active
+        ):
+            self._request_conversation_reset()
+
+    def _request_conversation_reset(self) -> None:
+        """Best-effort asynchronous reset of /conversation history."""
+
+        if not self.conversation_reset_client.service_is_ready():
+            self.node.get_logger().warning(
+                "/conversation/reset unavailable after back-panel mode change"
+            )
+            return
+
+        future = self.conversation_reset_client.call_async(
+            Trigger.Request()
+        )
+        future.add_done_callback(
+            self._conversation_reset_done
+        )
+
+    def _conversation_reset_done(self, future) -> None:
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.node.get_logger().warning(
+                f"Back-panel conversation reset failed: {exc}"
+            )
+            return
+
+        if result.success:
+            self.node.get_logger().info(
+                result.message
+                or "Conversation history reset after back-panel mode change"
+            )
+        else:
+            self.node.get_logger().warning(
+                result.message
+                or "Conversation reset rejected after back-panel mode change"
+            )
 
     def update(self) -> py_trees.common.Status:
         self.feedback_message = "monitoring ROS audio/dialogue events"
@@ -1453,13 +1610,32 @@ class EndConversation(py_trees.behaviour.Behaviour):
 
 
 class DialogueIdle(py_trees.behaviour.Behaviour):
-    """Visible idle leaf used while waiting for the next hotword."""
+    """Visible idle leaf while no persistent conversation is active."""
 
     def __init__(self, name: str = "Dialogue Idle") -> None:
         super().__init__(name=name)
 
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+        self.blackboard.register_key(
+            key=BlackboardKey.AUDIO_DESIRED_MODE,
+            access=py_trees.common.Access.READ,
+        )
+
     def update(self) -> py_trees.common.Status:
-        self.feedback_message = "waiting for hotword"
+        mode = self.blackboard.get(
+            BlackboardKey.AUDIO_DESIRED_MODE
+        )
+
+        if mode == AudioMode.NOT_LISTENING:
+            self.feedback_message = "not listening"
+        elif mode == AudioMode.WAITING_FOR_HOTWORD:
+            self.feedback_message = "waiting for hotword"
+        else:
+            self.feedback_message = f"idle; desired mode={mode}"
+
         return py_trees.common.Status.RUNNING
 
 
@@ -1527,23 +1703,9 @@ def create_audio_state_manager(
 ) -> py_trees.behaviour.Behaviour:
     process_audio_events = ProcessAudioEvents(node)
 
-    # Highest priority: while the voice node says K9 is talking, force the
-    # effective mode away from STT regardless of the persistent desired mode.
-    talking_override = sequence("Talking Override")
-    talking_override.add_children(
-        [
-            BlackboardEquals(
-                "K9 Talking?",
-                BlackboardKey.AUDIO_IS_TALKING,
-                True,
-            ),
-            MaintainAudioMode(
-                node,
-                "Ensure NotListening",
-                AudioMode.NOT_LISTENING,
-            ),
-        ]
-    )
+    # PROCESSING and SPEAKING are temporary interaction activities.
+    # k9_stt inhibits recognition from /interaction/activity, so the
+    # persistent effective mode can remain LISTENING throughout a conversation.
 
     listening_state = sequence("Listening State")
     listening_state.add_children(
@@ -1582,7 +1744,6 @@ def create_audio_state_manager(
     )
     maintain_effective_audio_state.add_children(
         [
-            talking_override,
             listening_state,
             hotword_state,
             MaintainAudioMode(
@@ -1883,7 +2044,8 @@ class K9BehaviourTreeShell(Node):
         )
         self.get_logger().info(
             "Conversation flow: persistent LISTENING; "
-            "/conversation/response -> voice; STOP_LISTENING exits"
+            "/interaction/activity inhibits STT while processing/speaking; "
+            "back-panel mode requests supported"
         )
         self.get_logger().info(
             "Tree snapshots: /k9_bt_shell/snapshots"
