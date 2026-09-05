@@ -1,1 +1,0 @@
-/home/hopkira/k9_ws/src/k9_bt_pkg/setup.py

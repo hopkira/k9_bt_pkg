@@ -131,6 +131,8 @@ class BlackboardKey:
     PERCEPTION_LAST_EVENT = "perception/last_event"
     PERCEPTION_EVENT_TRACK_ID = "perception/event_track_id"
     PERCEPTION_EVENT_IDENTITY = "perception/event_identity"
+    PERCEPTION_EVENT_RELATIONSHIP = "perception/event_relationship"
+    PERCEPTION_EVENT_PREFERRED_ADDRESS = "perception/event_preferred_address"
 
     PERCEPTION_ATTENDED_TRACK = "perception/attended_track"
     PERCEPTION_ATTENDED_PERSON = "perception/attended_person"
@@ -388,6 +390,18 @@ K9_BLACKBOARD_FIELDS: tuple[BlackboardField, ...] = (
         str,
         "",
         "Identity associated with the most recent perception event.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_EVENT_RELATIONSHIP,
+        str,
+        "",
+        "Relationship metadata for the identity in the most recent perception event.",
+    ),
+    BlackboardField(
+        BlackboardKey.PERCEPTION_EVENT_PREFERRED_ADDRESS,
+        str,
+        "",
+        "Preferred spoken form of address for the most recent recognised-person event.",
     ),
     BlackboardField(
         BlackboardKey.PERCEPTION_ATTENDED_TRACK,
