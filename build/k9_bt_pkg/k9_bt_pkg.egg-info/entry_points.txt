@@ -1,0 +1,2 @@
+[console_scripts]
+k9_bt = k9_bt_pkg.k9_bt:main

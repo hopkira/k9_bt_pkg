@@ -1,0 +1,69 @@
+[0.000000] (-) TimerEvent: {}
+[0.000576] (k9_bt_pkg) JobQueued: {'identifier': 'k9_bt_pkg', 'dependencies': OrderedDict()}
+[0.001044] (k9_bt_pkg) JobStarted: {'identifier': 'k9_bt_pkg'}
+[0.099375] (-) TimerEvent: {}
+[0.199921] (-) TimerEvent: {}
+[0.300379] (-) TimerEvent: {}
+[0.400851] (-) TimerEvent: {}
+[0.501348] (-) TimerEvent: {}
+[0.601793] (-) TimerEvent: {}
+[0.702247] (-) TimerEvent: {}
+[0.802675] (-) TimerEvent: {}
+[0.903092] (-) TimerEvent: {}
+[1.003557] (-) TimerEvent: {}
+[1.103994] (-) TimerEvent: {}
+[1.204456] (-) TimerEvent: {}
+[1.304911] (-) TimerEvent: {}
+[1.405350] (-) TimerEvent: {}
+[1.505766] (-) TimerEvent: {}
+[1.606162] (-) TimerEvent: {}
+[1.706645] (-) TimerEvent: {}
+[1.807146] (-) TimerEvent: {}
+[1.907587] (-) TimerEvent: {}
+[2.008039] (-) TimerEvent: {}
+[2.108555] (-) TimerEvent: {}
+[2.209152] (-) TimerEvent: {}
+[2.309777] (-) TimerEvent: {}
+[2.410376] (-) TimerEvent: {}
+[2.436952] (k9_bt_pkg) Command: {'cmd': ['/usr/bin/python3', '-W', 'ignore:setup.py install is deprecated', '-W', 'ignore:easy_install command is deprecated', 'setup.py', 'develop', '--editable', '--build-directory', '/home/hopkira/k9_ws/src/k9_bt_pkg/build/k9_bt_pkg/build', '--no-deps', 'symlink_data'], 'cwd': '/home/hopkira/k9_ws/src/k9_bt_pkg/build/k9_bt_pkg', 'env': {'LESSOPEN': '| /usr/bin/lesspipe %s', 'LANGUAGE': 'en_GB:en', 'USER': 'hopkira', 'SSH_CLIENT': 'fe80::818:89e:5adc:4de%wlP1p1s0 64036 22', 'LC_TIME': 'en_US.UTF-8', 'GZ_CONFIG_PATH': '/opt/ros/jazzy/opt/sdformat_vendor/share/gz', 'XDG_SESSION_TYPE': 'tty', 'SHLVL': '1', 'LD_LIBRARY_PATH': '/home/hopkira/k9_ws/install/sound_play_msgs/lib:/home/hopkira/k9_ws/install/k9_interfaces_pkg/lib:/home/hopkira/k9_ws/install/k9_drive_pkg/lib:/home/hopkira/k9_ws/install/audio_play/lib:/home/hopkira/k9_ws/install/audio_capture/lib:/home/hopkira/k9_ws/install/audio_common_msgs/lib:/usr/local/cuda/lib64:/opt/ros/jazzy/opt/sdformat_vendor/lib:/opt/ros/jazzy/opt/rviz_ogre_vendor/lib:/opt/ros/jazzy/lib/aarch64-linux-gnu:/opt/ros/jazzy/opt/gz_math_vendor/lib:/opt/ros/jazzy/opt/gz_utils_vendor/lib:/opt/ros/jazzy/opt/gz_tools_vendor/lib:/opt/ros/jazzy/opt/gz_cmake_vendor/lib:/opt/ros/jazzy/lib', 'HOME': '/home/hopkira', 'OLDPWD': '/home/hopkira/k9_ws', 'SSH_TTY': '/dev/pts/1', 'ROS_PYTHON_VERSION': '3', 'PS1': '(k9_venv) \\[\\e]0;\\u@\\h: \\w\\a\\]${debian_chroot:+($debian_chroot)}\\[\\033[01;32m\\]\\u@\\h\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$', 'LC_MONETARY': 'en_US.UTF-8', 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus', 'DEBUGINFOD_URLS': 'https://debuginfod.ubuntu.com', 'COLCON_PREFIX_PATH': '/home/hopkira/k9_ws/install', 'ROS_DISTRO': 'jazzy', 'LOGNAME': 'hopkira', '_': '/usr/bin/colcon', 'ROS_VERSION': '2', 'XDG_SESSION_CLASS': 'user', 'TERM': 'xterm-256color', 'XDG_SESSION_ID': '6', 'PATH': '/home/hopkira/k9_venv/bin:/home/hopkira/k9_ws/install/audio_play/bin:/home/hopkira/k9_ws/install/audio_capture/bin:/home/hopkira/.local/bin:/usr/local/cuda/bin:/opt/ros/jazzy/opt/gz_tools_vendor/bin:/opt/ros/jazzy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin', 'PAPERSIZE': 'letter', 'LC_ADDRESS': 'en_US.UTF-8', 'XDG_RUNTIME_DIR': '/run/user/1000', 'LANG': 'en_GB.UTF-8', 'LC_TELEPHONE': 'en_US.UTF-8', 'VIRTUAL_ENV_PROMPT': '(k9_venv)', 'RMW_IMPLEMENTATION': 'rmw_cyclonedds_cpp', 'LS_COLORS': 'rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=00:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arc=01;31:*.arj=01;31:*.taz=01;31:*.lha=01;31:*.lz4=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.tzo=01;31:*.t7z=01;31:*.zip=01;31:*.z=01;31:*.dz=01;31:*.gz=01;31:*.lrz=01;31:*.lz=01;31:*.lzo=01;31:*.xz=01;31:*.zst=01;31:*.tzst=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.cab=01;31:*.wim=01;31:*.swm=01;31:*.dwm=01;31:*.esd=01;31:*.avif=01;35:*.jpg=01;35:*.jpeg=01;35:*.mjpg=01;35:*.mjpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.webp=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.m4a=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:*.oga=00;36:*.opus=00;36:*.spx=00;36:*.xspf=00;36:*~=00;90:*#=00;90:*.bak=00;90:*.crdownload=00;90:*.dpkg-dist=00;90:*.dpkg-new=00;90:*.dpkg-old=00;90:*.dpkg-tmp=00;90:*.old=00;90:*.orig=00;90:*.part=00;90:*.rej=00;90:*.rpmnew=00;90:*.rpmorig=00;90:*.rpmsave=00;90:*.swp=00;90:*.tmp=00;90:*.ucf-dist=00;90:*.ucf-new=00;90:*.ucf-old=00;90:', 'ROS_DOMAIN_ID': '9', 'AMENT_PREFIX_PATH': '/home/hopkira/k9_ws/install/audio_common:/home/hopkira/k9_ws/install/sound_play:/home/hopkira/k9_ws/install/sound_play_msgs:/home/hopkira/k9_ws/install/k9_system_pkg:/home/hopkira/k9_ws/install/k9_stt_pkg:/home/hopkira/k9_ws/install/k9_jetson_pkg:/home/hopkira/k9_ws/install/k9_bt_pkg:/home/hopkira/k9_ws/install/k9_interfaces_pkg:/home/hopkira/k9_ws/install/k9_drive_pkg:/home/hopkira/k9_ws/install/audio_play:/home/hopkira/k9_ws/install/audio_capture:/home/hopkira/k9_ws/install/audio_common_msgs:/opt/ros/jazzy', 'SHELL': '/bin/bash', 'LC_NAME': 'en_US.UTF-8', 'LESSCLOSE': '/usr/bin/lesspipe %s %s', 'LC_MEASUREMENT': 'en_US.UTF-8', 'LC_IDENTIFICATION': 'en_US.UTF-8', 'VIRTUAL_ENV': '/home/hopkira/k9_venv', 'ROS_AUTOMATIC_DISCOVERY_RANGE': 'SUBNET', 'PWD': '/home/hopkira/k9_ws/src/k9_bt_pkg/build/k9_bt_pkg', 'LC_ALL': 'en_US.UTF-8', 'SSH_CONNECTION': 'fe80::818:89e:5adc:4de%wlP1p1s0 64036 fe80::4517:ae08:e22c:a5e3%wlP1p1s0 22', 'XDG_DATA_DIRS': '/usr/share/gnome:/usr/local/share:/usr/share:/var/lib/snapd/desktop', 'PYTHONPATH': '/home/hopkira/k9_ws/src/k9_bt_pkg/build/k9_bt_pkg/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/lib/python3.12/site-packages:/home/hopkira/k9_ws/install/sound_play/lib/python3.12/site-packages:/home/hopkira/k9_ws/install/sound_play_msgs/lib/python3.12/site-packages:/home/hopkira/k9_ws/build/k9_system_pkg:/home/hopkira/k9_ws/install/k9_system_pkg/lib/python3.12/site-packages:/home/hopkira/k9_ws/build/k9_bt_pkg:/home/hopkira/k9_ws/install/k9_bt_pkg/lib/python3.12/site-packages:/home/hopkira/k9_ws/install/k9_interfaces_pkg/lib/python3.12/site-packages:/home/hopkira/k9_ws/install/audio_common_msgs/lib/python3.12/site-packages:/opt/ros/jazzy/lib/python3.12/site-packages', 'LC_NUMERIC': 'en_US.UTF-8', 'LC_PAPER': 'en_US.UTF-8', 'COLCON': '1', 'CMAKE_PREFIX_PATH': '/home/hopkira/k9_ws/install/audio_common:/home/hopkira/k9_ws/install/sound_play:/home/hopkira/k9_ws/install/sound_play_msgs:/home/hopkira/k9_ws/install/k9_stt_pkg:/home/hopkira/k9_ws/install/k9_jetson_pkg:/home/hopkira/k9_ws/install/k9_interfaces_pkg:/home/hopkira/k9_ws/install/k9_drive_pkg:/home/hopkira/k9_ws/install/audio_play:/home/hopkira/k9_ws/install/audio_capture:/home/hopkira/k9_ws/install/audio_common_msgs:/opt/ros/jazzy/opt/sdformat_vendor:/opt/ros/jazzy/opt/gz_math_vendor:/opt/ros/jazzy/opt/gz_utils_vendor:/opt/ros/jazzy/opt/gz_tools_vendor:/opt/ros/jazzy/opt/gz_cmake_vendor'}, 'shell': False}
+[2.510531] (-) TimerEvent: {}
+[2.611060] (-) TimerEvent: {}
+[2.711668] (-) TimerEvent: {}
+[2.812271] (-) TimerEvent: {}
+[2.912780] (-) TimerEvent: {}
+[3.013340] (-) TimerEvent: {}
+[3.113897] (-) TimerEvent: {}
+[3.118192] (k9_bt_pkg) StdoutLine: {'line': b'running develop\n'}
+[3.214045] (-) TimerEvent: {}
+[3.314609] (-) TimerEvent: {}
+[3.415123] (-) TimerEvent: {}
+[3.515739] (-) TimerEvent: {}
+[3.517041] (k9_bt_pkg) StdoutLine: {'line': b'running egg_info\n'}
+[3.517570] (k9_bt_pkg) StdoutLine: {'line': b'creating k9_bt_pkg.egg-info\n'}
+[3.557734] (k9_bt_pkg) StdoutLine: {'line': b'writing k9_bt_pkg.egg-info/PKG-INFO\n'}
+[3.558391] (k9_bt_pkg) StdoutLine: {'line': b'writing dependency_links to k9_bt_pkg.egg-info/dependency_links.txt\n'}
+[3.558795] (k9_bt_pkg) StdoutLine: {'line': b'writing entry points to k9_bt_pkg.egg-info/entry_points.txt\n'}
+[3.559135] (k9_bt_pkg) StdoutLine: {'line': b'writing requirements to k9_bt_pkg.egg-info/requires.txt\n'}
+[3.559405] (k9_bt_pkg) StdoutLine: {'line': b'writing top-level names to k9_bt_pkg.egg-info/top_level.txt\n'}
+[3.559725] (k9_bt_pkg) StdoutLine: {'line': b"writing manifest file 'k9_bt_pkg.egg-info/SOURCES.txt'\n"}
+[3.615858] (-) TimerEvent: {}
+[3.646379] (k9_bt_pkg) StdoutLine: {'line': b"reading manifest file 'k9_bt_pkg.egg-info/SOURCES.txt'\n"}
+[3.647222] (k9_bt_pkg) StdoutLine: {'line': b"writing manifest file 'k9_bt_pkg.egg-info/SOURCES.txt'\n"}
+[3.704997] (k9_bt_pkg) StdoutLine: {'line': b'running build_ext\n'}
+[3.705543] (k9_bt_pkg) StdoutLine: {'line': b'Creating /home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/lib/python3.12/site-packages/k9-bt-pkg.egg-link (link to .)\n'}
+[3.706475] (k9_bt_pkg) StdoutLine: {'line': b'Installing k9_bt script to /home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/lib/k9_bt_pkg\n'}
+[3.706970] (k9_bt_pkg) StdoutLine: {'line': b'\n'}
+[3.707332] (k9_bt_pkg) StdoutLine: {'line': b'Installed /home/hopkira/k9_ws/src/k9_bt_pkg/build/k9_bt_pkg\n'}
+[3.707815] (k9_bt_pkg) StdoutLine: {'line': b'running symlink_data\n'}
+[3.708196] (k9_bt_pkg) StdoutLine: {'line': b'creating /home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/share/ament_index\n'}
+[3.708513] (k9_bt_pkg) StdoutLine: {'line': b'creating /home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/share/ament_index/resource_index\n'}
+[3.708775] (k9_bt_pkg) StdoutLine: {'line': b'creating /home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/share/ament_index/resource_index/packages\n'}
+[3.709030] (k9_bt_pkg) StdoutLine: {'line': b'symbolically linking /home/hopkira/k9_ws/src/k9_bt_pkg/build/k9_bt_pkg/resource/k9_bt_pkg -> /home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/share/ament_index/resource_index/packages\n'}
+[3.709283] (k9_bt_pkg) StdoutLine: {'line': b'symbolically linking /home/hopkira/k9_ws/src/k9_bt_pkg/build/k9_bt_pkg/package.xml -> /home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/share/k9_bt_pkg\n'}
+[3.709526] (k9_bt_pkg) StdoutLine: {'line': b'creating /home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/share/k9_bt_pkg/launch\n'}
+[3.709765] (k9_bt_pkg) StdoutLine: {'line': b'symbolically linking /home/hopkira/k9_ws/src/k9_bt_pkg/build/k9_bt_pkg/launch/viewer.launch.py -> /home/hopkira/k9_ws/src/k9_bt_pkg/install/k9_bt_pkg/share/k9_bt_pkg/launch\n'}
+[3.715942] (-) TimerEvent: {}
+[3.799520] (k9_bt_pkg) CommandEnded: {'returncode': 0}
+[3.816465] (-) TimerEvent: {}
+[3.836311] (k9_bt_pkg) JobEnded: {'identifier': 'k9_bt_pkg', 'rc': 0}
+[3.838603] (-) EventReactorShutdown: {}

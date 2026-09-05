@@ -16,6 +16,11 @@ This version implements the persistent LLM conversation loop:
         -> reset conversation history
         -> WAITING_FOR_HOTWORD
 
+Face enrolment is an executive conversational branch:
+
+    ENROL_FACE -> ask name -> family/friend -> optional form of address
+               -> front/left/right capture -> commit -> LISTENING
+
 The desired and effective audio modes remain LISTENING for the lifetime of an
 active conversation. PROCESSING and SPEAKING are temporary interaction
 activities published on /interaction/activity; the STT node inhibits recognition
@@ -37,6 +42,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import json
+import re
 import threading
 import py_trees
 import py_trees_ros
@@ -53,7 +60,8 @@ from rclpy.qos import (
     QoSHistoryPolicy,
 )
 
-from k9_interfaces_pkg.action import SpeakText
+from k9_interfaces_pkg.action import CaptureFace, SpeakText
+from k9_interfaces_pkg.srv import CommitFaceEnrollment
 from k9_interfaces_pkg.msg import (
     IntentResult,
     RecognisedFaceArray,
@@ -1515,6 +1523,881 @@ class SpeakPendingResponse(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
+class FaceEnrollmentDialogue(py_trees.behaviour.Behaviour):
+    """Run K9's spoken face-enrolment dialogue as one persistent BT leaf.
+
+    The leaf is entered after the initial ENROL_FACE intent. It then publishes
+    /intent/context so subsequent STT utterances are classified as enrolment
+    answers rather than GENERAL_CONVERSATION.
+
+    Face capture itself is delegated to the face_recogniser action server;
+    this behaviour owns only dialogue, sequencing, retry/cancel policy and the
+    final metadata commit.
+    """
+
+    FRONT_SAMPLES = 4
+    LEFT_SAMPLES = 3
+    RIGHT_SAMPLES = 3
+    MAX_CAPTURE_ATTEMPTS = 2
+
+    def __init__(
+        self,
+        *,
+        node: Node,
+        name: str = "Face Enrolment Dialogue",
+    ) -> None:
+        super().__init__(name=name)
+
+        self.node = node
+
+        self.speech_client = ActionClient(
+            node,
+            SpeakText,
+            "/voice/speak",
+        )
+        self.capture_client = ActionClient(
+            node,
+            CaptureFace,
+            "/face_recogniser/capture_face",
+        )
+        self.commit_client = node.create_client(
+            CommitFaceEnrollment,
+            "/face_recogniser/commit_enrolment",
+        )
+        self.discard_client = node.create_client(
+            Trigger,
+            "/face_recogniser/discard_enrolment",
+        )
+        self.intent_context_publisher = node.create_publisher(
+            String,
+            "/intent/context",
+            10,
+        )
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        for key in [
+            BlackboardKey.DIALOGUE_COMMAND,
+            BlackboardKey.DIALOGUE_INTENT,
+            BlackboardKey.DIALOGUE_INTENT_CONFIDENCE,
+            BlackboardKey.DIALOGUE_STATE,
+            BlackboardKey.DIALOGUE_ERROR,
+            BlackboardKey.AUDIO_HEARD_TEXT,
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+        ]:
+            register_read_write(
+                self.blackboard,
+                key,
+            )
+
+        self.stage = "IDLE"
+        self.next_stage = ""
+
+        self.identity = ""
+        self.relationship = ""
+        self.preferred_address = ""
+
+        self.speech_goal_future = None
+        self.speech_goal_handle = None
+        self.speech_result_future = None
+
+        self.capture_goal_future = None
+        self.capture_goal_handle = None
+        self.capture_result_future = None
+        self.capture_pose = ""
+        self.capture_samples = 0
+        self.capture_attempts = {}
+        self.capture_feedback_state = ""
+
+        self.commit_future = None
+        self.discard_future = None
+        self.end_message = ""
+
+    # ------------------------------------------------------------------
+    # Lifecycle / small helpers
+    # ------------------------------------------------------------------
+
+    def initialise(self) -> None:
+        self.stage = "IDLE"
+        self.next_stage = ""
+
+        self.identity = ""
+        self.relationship = ""
+        self.preferred_address = ""
+
+        self.speech_goal_future = None
+        self.speech_goal_handle = None
+        self.speech_result_future = None
+
+        self.capture_goal_future = None
+        self.capture_goal_handle = None
+        self.capture_result_future = None
+        self.capture_pose = ""
+        self.capture_samples = 0
+        self.capture_attempts = {}
+        self.capture_feedback_state = ""
+
+        self.commit_future = None
+        self.discard_future = None
+        self.end_message = ""
+
+        # Consume the original "remember me" turn. The surrounding sequence
+        # is memory=True, so later ENROL_FACE_ANSWER intents will not make it
+        # re-check the initial IsIntent leaf.
+        self._consume_input()
+
+        self._start_speech(
+            "Certainly. What is your name?",
+            "WAIT_NAME",
+        )
+
+    def terminate(
+        self,
+        new_status: py_trees.common.Status,
+    ) -> None:
+        if new_status == py_trees.common.Status.RUNNING:
+            return
+
+        self._publish_intent_context("")
+
+        if (
+            self.capture_goal_handle is not None
+            and self.capture_result_future is not None
+            and not self.capture_result_future.done()
+        ):
+            try:
+                self.capture_goal_handle.cancel_goal_async()
+            except Exception:
+                pass
+
+    def _publish_intent_context(
+        self,
+        enrolment_state: str,
+    ) -> None:
+        if enrolment_state:
+            payload = {
+                "enrolment_state": enrolment_state,
+            }
+        else:
+            payload = {}
+
+        self.intent_context_publisher.publish(
+            String(
+                data=json.dumps(
+                    payload,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        )
+
+    def _consume_input(self) -> None:
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_COMMAND,
+            "",
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_INTENT,
+            Intent.NONE,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_INTENT_CONFIDENCE,
+            0.0,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.AUDIO_HEARD_TEXT,
+            "",
+            overwrite=True,
+        )
+
+    def _current_input(self):
+        command = self.blackboard.get(
+            BlackboardKey.DIALOGUE_COMMAND
+        ).strip()
+        intent = self.blackboard.get(
+            BlackboardKey.DIALOGUE_INTENT
+        )
+        return intent, command
+
+    @staticmethod
+    def _normalise_text(text: str) -> str:
+        normal = text.lower().replace("’", "'")
+        normal = re.sub(r"[^a-z0-9'\s-]", " ", normal)
+        normal = normal.replace("-", " ")
+        return re.sub(r"\s+", " ", normal).strip()
+
+    @staticmethod
+    def _extract_name(text: str) -> str:
+        cleaned = text.strip(" \t\r\n.,!?")
+
+        patterns = [
+            r"(?i)\bmy name is\s+([a-z][a-z' -]{0,40})$",
+            r"(?i)\bi am\s+([a-z][a-z' -]{0,40})$",
+            r"(?i)\bi'm\s+([a-z][a-z' -]{0,40})$",
+            r"(?i)\bcall me\s+([a-z][a-z' -]{0,40})$",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, cleaned)
+            if match:
+                return FaceEnrollmentDialogue._title_words(
+                    match.group(1)
+                )
+
+        if "?" not in text:
+            words = re.findall(
+                r"[A-Za-z][A-Za-z'-]*",
+                cleaned,
+            )
+            if 1 <= len(words) <= 3 and len(cleaned) <= 40:
+                return FaceEnrollmentDialogue._title_words(
+                    " ".join(words)
+                )
+
+        return ""
+
+    @staticmethod
+    def _extract_relationship(text: str) -> str:
+        normal = FaceEnrollmentDialogue._normalise_text(text)
+
+        has_family = re.search(
+            r"\b(?:family|relative|relation)\b",
+            normal,
+        ) is not None
+        has_friend = re.search(
+            r"\bfriend\b",
+            normal,
+        ) is not None
+
+        if has_family and not has_friend:
+            return "family"
+        if has_friend and not has_family:
+            return "friend"
+        return ""
+
+    @staticmethod
+    def _extract_preferred_address(text: str) -> str:
+        cleaned = text.strip(" \t\r\n.,!?")
+
+        patterns = [
+            r"(?i)^call me\s+(.+)$",
+            r"(?i)^address me as\s+(.+)$",
+            r"(?i)^you can call me\s+(.+)$",
+            r"(?i)^please call me\s+(.+)$",
+        ]
+
+        for pattern in patterns:
+            match = re.match(pattern, cleaned)
+            if match:
+                cleaned = match.group(1).strip(" .,!?")
+                break
+
+        words = re.findall(
+            r"[A-Za-z][A-Za-z'-]*",
+            cleaned,
+        )
+
+        if not (1 <= len(words) <= 4):
+            return ""
+
+        value = " ".join(words)
+        if len(value) > 40:
+            return ""
+
+        return FaceEnrollmentDialogue._title_words(value)
+
+    @staticmethod
+    def _title_words(text: str) -> str:
+        return " ".join(
+            part.capitalize()
+            for part in text.split()
+        )
+
+    def _address_for_speech(self) -> str:
+        if self.relationship == "family":
+            return self.preferred_address or self.identity
+        return self.identity
+
+    # ------------------------------------------------------------------
+    # Speech
+    # ------------------------------------------------------------------
+
+    def _start_speech(
+        self,
+        text: str,
+        next_stage: str,
+    ) -> None:
+        self._publish_intent_context("SPEAKING")
+
+        self.stage = "SPEAKING"
+        self.next_stage = next_stage
+
+        self.speech_goal_future = None
+        self.speech_goal_handle = None
+        self.speech_result_future = None
+
+        if not self.speech_client.server_is_ready():
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_ERROR,
+                "voice action server unavailable during face enrolment",
+                overwrite=True,
+            )
+            self.stage = "FINISHED"
+            return
+
+        goal = SpeakText.Goal()
+        goal.text = text
+        goal.owner = "face_enrolment"
+        goal.priority = 100
+        goal.interrupt_lower_priority = True
+        goal.clear_lower_priority = True
+
+        self.speech_goal_future = self.speech_client.send_goal_async(
+            goal
+        )
+
+        self.feedback_message = text
+
+    def _update_speech(self) -> None:
+        if self.speech_goal_future is None:
+            self.stage = "FINISHED"
+            return
+
+        if self.speech_goal_handle is None:
+            if not self.speech_goal_future.done():
+                return
+
+            try:
+                self.speech_goal_handle = self.speech_goal_future.result()
+            except Exception as exc:
+                self.blackboard.set(
+                    BlackboardKey.DIALOGUE_ERROR,
+                    f"enrolment speech goal failed: {exc}",
+                    overwrite=True,
+                )
+                self.stage = "FINISHED"
+                return
+
+            if (
+                self.speech_goal_handle is None
+                or not self.speech_goal_handle.accepted
+            ):
+                self.blackboard.set(
+                    BlackboardKey.DIALOGUE_ERROR,
+                    "enrolment speech goal rejected",
+                    overwrite=True,
+                )
+                self.stage = "FINISHED"
+                return
+
+            self.speech_result_future = (
+                self.speech_goal_handle.get_result_async()
+            )
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_STATE,
+                DialogueState.SPEAKING,
+                overwrite=True,
+            )
+            return
+
+        if (
+            self.speech_result_future is None
+            or not self.speech_result_future.done()
+        ):
+            return
+
+        try:
+            wrapped = self.speech_result_future.result()
+            result = wrapped.result
+        except Exception as exc:
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_ERROR,
+                f"enrolment speech failed: {exc}",
+                overwrite=True,
+            )
+            self.stage = "FINISHED"
+            return
+
+        if not result.success:
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_ERROR,
+                result.message,
+                overwrite=True,
+            )
+            self.stage = "FINISHED"
+            return
+
+        self.stage = self.next_stage
+        self.next_stage = ""
+
+        if self.stage.startswith("WAIT_"):
+            self._publish_intent_context(self.stage)
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_STATE,
+                DialogueState.IDLE,
+                overwrite=True,
+            )
+        elif self.stage.startswith("START_"):
+            self._publish_intent_context("CAPTURING")
+        elif self.stage == "FINISHED":
+            self._publish_intent_context("")
+
+    # ------------------------------------------------------------------
+    # Face capture action
+    # ------------------------------------------------------------------
+
+    def _start_capture(
+        self,
+        pose: str,
+        samples: int,
+    ) -> None:
+        if not self.capture_client.server_is_ready():
+            self._begin_end(
+                "My face recognition system is unavailable at present."
+            )
+            return
+
+        self.capture_pose = pose
+        self.capture_samples = samples
+        self.capture_feedback_state = ""
+
+        self.capture_attempts[pose] = (
+            self.capture_attempts.get(pose, 0) + 1
+        )
+
+        goal = CaptureFace.Goal()
+        goal.identity = self.identity
+        goal.pose = pose
+        goal.samples_required = int(samples)
+
+        self.capture_goal_future = self.capture_client.send_goal_async(
+            goal,
+            feedback_callback=self._capture_feedback_callback,
+        )
+        self.capture_goal_handle = None
+        self.capture_result_future = None
+        self.stage = "CAPTURING"
+        self._publish_intent_context("CAPTURING")
+
+        self.feedback_message = (
+            f"capturing {pose} face samples "
+            f"attempt {self.capture_attempts[pose]}"
+        )
+
+    def _capture_feedback_callback(self, feedback_msg) -> None:
+        feedback = feedback_msg.feedback
+        self.capture_feedback_state = feedback.state
+
+    def _retry_capture_message(
+        self,
+        pose: str,
+        failure_message: str,
+    ) -> str:
+        if pose == "front":
+            instruction = "Please look directly at me and we shall try again."
+        elif pose == "left":
+            instruction = (
+                "Please turn your head slightly to your left and we shall "
+                "try again."
+            )
+        else:
+            instruction = (
+                "Please turn your head slightly to your right and we shall "
+                "try again."
+            )
+
+        return f"{failure_message} {instruction}".strip()
+
+    def _update_capture(self) -> None:
+        if self.capture_goal_handle is None:
+            if not self.capture_goal_future.done():
+                return
+
+            try:
+                self.capture_goal_handle = self.capture_goal_future.result()
+            except Exception as exc:
+                self._begin_end(
+                    f"Face capture failed: {exc}"
+                )
+                return
+
+            if (
+                self.capture_goal_handle is None
+                or not self.capture_goal_handle.accepted
+            ):
+                self._begin_end(
+                    "My face recognition system rejected the capture request."
+                )
+                return
+
+            self.capture_result_future = (
+                self.capture_goal_handle.get_result_async()
+            )
+            return
+
+        if (
+            self.capture_result_future is None
+            or not self.capture_result_future.done()
+        ):
+            return
+
+        try:
+            wrapped = self.capture_result_future.result()
+            result = wrapped.result
+        except Exception as exc:
+            self._begin_end(
+                f"Face capture failed: {exc}"
+            )
+            return
+
+        pose = self.capture_pose
+
+        self.capture_goal_future = None
+        self.capture_goal_handle = None
+        self.capture_result_future = None
+
+        if result.success:
+            if pose == "front":
+                self._start_speech(
+                    "Good. Now turn your head slightly to your left.",
+                    "START_LEFT",
+                )
+            elif pose == "left":
+                self._start_speech(
+                    "Thank you. Now turn slightly to your right.",
+                    "START_RIGHT",
+                )
+            else:
+                self.stage = "START_COMMIT"
+                self._publish_intent_context("COMMITTING")
+            return
+
+        attempts = self.capture_attempts.get(pose, 1)
+
+        if attempts < self.MAX_CAPTURE_ATTEMPTS:
+            retry_stage = {
+                "front": "START_FRONT",
+                "left": "START_LEFT",
+                "right": "START_RIGHT",
+            }[pose]
+
+            self._start_speech(
+                self._retry_capture_message(
+                    pose,
+                    result.message,
+                ),
+                retry_stage,
+            )
+            return
+
+        self._begin_end(
+            result.message
+            or "I am unable to obtain suitable face samples at present."
+        )
+
+    # ------------------------------------------------------------------
+    # Commit / discard
+    # ------------------------------------------------------------------
+
+    def _start_commit(self) -> None:
+        if not self.commit_client.service_is_ready():
+            self._begin_end(
+                "I cannot save the face enrolment at present."
+            )
+            return
+
+        request = CommitFaceEnrollment.Request()
+        request.identity = self.identity
+        request.relationship = self.relationship
+        request.preferred_address = self.preferred_address
+
+        self.commit_future = self.commit_client.call_async(
+            request
+        )
+        self.stage = "COMMITTING"
+        self._publish_intent_context("COMMITTING")
+
+    def _update_commit(self) -> None:
+        if self.commit_future is None or not self.commit_future.done():
+            return
+
+        try:
+            result = self.commit_future.result()
+        except Exception as exc:
+            self._begin_end(
+                f"I could not save your identity: {exc}"
+            )
+            return
+
+        self.commit_future = None
+
+        if not result.success:
+            self._begin_end(
+                result.message
+                or "I could not save your identity."
+            )
+            return
+
+        address = self._address_for_speech()
+        self._start_speech(
+            f"Excellent. I shall remember you, {address}.",
+            "FINISHED",
+        )
+
+    def _begin_end(self, message: str) -> None:
+        """Cancel any live capture, discard staging, then speak message."""
+
+        self.end_message = message
+        self._consume_input()
+        self._publish_intent_context("CANCELLING")
+
+        if (
+            self.capture_goal_handle is not None
+            and self.capture_result_future is not None
+            and not self.capture_result_future.done()
+        ):
+            try:
+                self.capture_goal_handle.cancel_goal_async()
+            except Exception:
+                pass
+            self.stage = "END_WAIT_CAPTURE"
+            return
+
+        if (
+            self.capture_goal_future is not None
+            and not self.capture_goal_future.done()
+        ):
+            self.stage = "END_WAIT_GOAL"
+            return
+
+        self._start_discard()
+
+    def _update_end_wait_goal(self) -> None:
+        if not self.capture_goal_future.done():
+            return
+
+        try:
+            self.capture_goal_handle = self.capture_goal_future.result()
+        except Exception:
+            self.capture_goal_handle = None
+
+        if (
+            self.capture_goal_handle is not None
+            and self.capture_goal_handle.accepted
+        ):
+            try:
+                self.capture_goal_handle.cancel_goal_async()
+            except Exception:
+                pass
+            self.capture_result_future = (
+                self.capture_goal_handle.get_result_async()
+            )
+            self.stage = "END_WAIT_CAPTURE"
+            return
+
+        self._start_discard()
+
+    def _update_end_wait_capture(self) -> None:
+        if (
+            self.capture_result_future is not None
+            and not self.capture_result_future.done()
+        ):
+            return
+
+        self.capture_goal_future = None
+        self.capture_goal_handle = None
+        self.capture_result_future = None
+        self._start_discard()
+
+    def _start_discard(self) -> None:
+        if not self.discard_client.service_is_ready():
+            self._start_speech(
+                self.end_message,
+                "FINISHED",
+            )
+            return
+
+        self.discard_future = self.discard_client.call_async(
+            Trigger.Request()
+        )
+        self.stage = "DISCARDING"
+
+    def _update_discard(self) -> None:
+        if self.discard_future is None or not self.discard_future.done():
+            return
+
+        try:
+            result = self.discard_future.result()
+            if not result.success:
+                self.node.get_logger().warning(
+                    result.message
+                    or "Face enrolment staging could not be discarded"
+                )
+        except Exception as exc:
+            self.node.get_logger().warning(
+                f"Face enrolment discard failed: {exc}"
+            )
+
+        self.discard_future = None
+        self._start_speech(
+            self.end_message,
+            "FINISHED",
+        )
+
+    # ------------------------------------------------------------------
+    # BT update
+    # ------------------------------------------------------------------
+
+    def update(self) -> py_trees.common.Status:
+        if not self.blackboard.get(
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
+        ):
+            self.feedback_message = "conversation ended during enrolment"
+            self._publish_intent_context("")
+            return py_trees.common.Status.SUCCESS
+
+        current_intent, current_command = self._current_input()
+
+        if (
+            current_intent == "ENROL_FACE_CANCEL"
+            and current_command
+            and not self.stage.startswith("END_")
+            and self.stage not in {"DISCARDING", "FINISHED"}
+        ):
+            self._begin_end(
+                "Very well. Enrolment cancelled."
+            )
+
+        if self.stage == "SPEAKING":
+            self._update_speech()
+
+        elif self.stage == "WAIT_NAME":
+            if current_command:
+                name = self._extract_name(current_command)
+                self._consume_input()
+
+                if not name:
+                    self._start_speech(
+                        "I did not catch your name. Please give me just your name.",
+                        "WAIT_NAME",
+                    )
+                else:
+                    self.identity = name
+                    self._start_speech(
+                        "Are you a member of my family, or a friend?",
+                        "WAIT_RELATIONSHIP",
+                    )
+
+        elif self.stage == "WAIT_RELATIONSHIP":
+            if current_command:
+                relationship = self._extract_relationship(
+                    current_command
+                )
+                self._consume_input()
+
+                if not relationship:
+                    self._start_speech(
+                        "Please say family or friend.",
+                        "WAIT_RELATIONSHIP",
+                    )
+                elif relationship == "family":
+                    self.relationship = "family"
+                    self._start_speech(
+                        "And how should I address you?",
+                        "WAIT_ADDRESS",
+                    )
+                else:
+                    self.relationship = "friend"
+                    self.preferred_address = self.identity
+                    self._start_speech(
+                        f"Very good, {self.identity}. "
+                        "Please look directly at me.",
+                        "START_FRONT",
+                    )
+
+        elif self.stage == "WAIT_ADDRESS":
+            if current_command:
+                preferred_address = self._extract_preferred_address(
+                    current_command
+                )
+                self._consume_input()
+
+                if not preferred_address:
+                    self._start_speech(
+                        "I did not catch that. How should I address you?",
+                        "WAIT_ADDRESS",
+                    )
+                else:
+                    self.preferred_address = preferred_address
+                    self._start_speech(
+                        f"Very good, {preferred_address}. "
+                        "Please look directly at me.",
+                        "START_FRONT",
+                    )
+
+        elif self.stage == "START_FRONT":
+            self._start_capture(
+                "front",
+                self.FRONT_SAMPLES,
+            )
+
+        elif self.stage == "START_LEFT":
+            self._start_capture(
+                "left",
+                self.LEFT_SAMPLES,
+            )
+
+        elif self.stage == "START_RIGHT":
+            self._start_capture(
+                "right",
+                self.RIGHT_SAMPLES,
+            )
+
+        elif self.stage == "CAPTURING":
+            self._update_capture()
+
+        elif self.stage == "START_COMMIT":
+            self._start_commit()
+
+        elif self.stage == "COMMITTING":
+            self._update_commit()
+
+        elif self.stage == "END_WAIT_GOAL":
+            self._update_end_wait_goal()
+
+        elif self.stage == "END_WAIT_CAPTURE":
+            self._update_end_wait_capture()
+
+        elif self.stage == "DISCARDING":
+            self._update_discard()
+
+        elif self.stage == "FINISHED":
+            self._publish_intent_context("")
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_STATE,
+                DialogueState.IDLE,
+                overwrite=True,
+            )
+            self.feedback_message = "face enrolment complete"
+            return py_trees.common.Status.SUCCESS
+
+        self.feedback_message = (
+            f"face enrolment: {self.stage}"
+            + (
+                f" ({self.capture_feedback_state})"
+                if self.capture_feedback_state
+                else ""
+            )
+        )
+        return py_trees.common.Status.RUNNING
+
+
 class ClearConversationTurn(py_trees.behaviour.Behaviour):
     """Finish one normal turn and remain in the active conversation."""
 
@@ -1792,6 +2675,21 @@ def create_dialogue_manager(
         ]
     )
 
+    # Face enrolment is a stateful spoken workflow. Once entered, the sequence
+    # remains on FaceEnrollmentDialogue while the intent node classifies the
+    # user's name / relationship / preferred-address answers contextually.
+    face_enrolment = py_trees.composites.Sequence(
+        name="Face Enrolment",
+        memory=True,
+    )
+    face_enrolment.add_children(
+        [
+            IsIntent("ENROL_FACE"),
+            FaceEnrollmentDialogue(node=node),
+            ClearConversationTurn(),
+        ]
+    )
+
     # Normal conversational turn. The /conversation node has already received
     # the same /intent/result independently and is generating asynchronously.
     # We simply wait for its latched /conversation/response, speak it, then
@@ -1831,6 +2729,7 @@ def create_dialogue_manager(
     handle_turn.add_children(
         [
             stop_conversation,
+            face_enrolment,
             general_conversation,
             unimplemented_intent,
         ]

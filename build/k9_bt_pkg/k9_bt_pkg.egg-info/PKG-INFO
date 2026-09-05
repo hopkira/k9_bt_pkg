@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: k9-bt-pkg
+Version: 0.0.1
+Summary: Behaviour tree for K9
+Maintainer: hopkira
+Maintainer-email: hopkira@googlemail.com
+License: Apache-2.0
