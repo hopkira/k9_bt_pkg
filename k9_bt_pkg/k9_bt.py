@@ -685,6 +685,8 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
             BlackboardKey.PERCEPTION_LAST_EVENT,
             BlackboardKey.PERCEPTION_EVENT_TRACK_ID,
             BlackboardKey.PERCEPTION_EVENT_IDENTITY,
+            BlackboardKey.PERCEPTION_EVENT_RELATIONSHIP,
+            BlackboardKey.PERCEPTION_EVENT_PREFERRED_ADDRESS,
             BlackboardKey.PERCEPTION_ERROR,
         ]:
             register_read_write(
@@ -733,6 +735,16 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
                 "confidence": float(
                     face.recognition_confidence
                 ),
+                "relationship": (
+                    face.relationship.strip()
+                    if face.recognised
+                    else ""
+                ),
+                "preferred_address": (
+                    face.preferred_address.strip()
+                    if face.recognised
+                    else ""
+                ),
             }
 
         with self._lock:
@@ -744,6 +756,8 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
         event: str,
         track_id: int,
         identity: str = "",
+        relationship: str = "",
+        preferred_address: str = "",
     ) -> None:
         self.blackboard.set(
             BlackboardKey.PERCEPTION_LAST_EVENT,
@@ -758,6 +772,16 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
         self.blackboard.set(
             BlackboardKey.PERCEPTION_EVENT_IDENTITY,
             identity,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_EVENT_RELATIONSHIP,
+            relationship,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_EVENT_PREFERRED_ADDRESS,
+            preferred_address,
             overwrite=True,
         )
 
@@ -776,6 +800,16 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
         )
         self.blackboard.set(
             BlackboardKey.PERCEPTION_EVENT_IDENTITY,
+            "",
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_EVENT_RELATIONSHIP,
+            "",
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.PERCEPTION_EVENT_PREFERRED_ADDRESS,
             "",
             overwrite=True,
         )
@@ -876,10 +910,18 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
                 track_id
             ]
 
+            event = (
+                "KNOWN_PERSON_APPEARED"
+                if face["recognised"]
+                else "PERSON_APPEARED"
+            )
+
             self._set_event(
-                "PERSON_APPEARED",
+                event,
                 track_id,
                 face["identity"],
+                face["relationship"],
+                face["preferred_address"],
             )
 
             event_generated = True
@@ -906,6 +948,8 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
                         "KNOWN_PERSON_APPEARED",
                         track_id,
                         current["identity"],
+                        current["relationship"],
+                        current["preferred_address"],
                     )
 
                     event_generated = True
@@ -934,6 +978,8 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
                 event,
                 track_id,
                 previous["identity"],
+                previous["relationship"],
+                previous["preferred_address"],
             )
 
         self._previous_faces = (
@@ -954,6 +1000,482 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
             )
 
         return py_trees.common.Status.RUNNING
+
+
+# ---------------------------------------------------------------------------
+# Recognition-triggered social greeting
+# ---------------------------------------------------------------------------
+
+class KnownPersonGreetingManager(py_trees.behaviour.Behaviour):
+    """Greet each recognised identity once during a conversation session.
+
+    Recognition can start a conversation from WAITING_FOR_HOTWORD, but it
+    deliberately does not override NOT_LISTENING. If another known person
+    appears during an active conversation, the greeting is queued until the
+    current dialogue turn and any speech have finished.
+
+    The per-session greeted set is cleared when the conversation ends. A person
+    who remains continuously visible after STOP_LISTENING therefore does not
+    immediately restart the conversation; a fresh recognition transition is
+    required.
+    """
+
+    def __init__(
+        self,
+        node: Node,
+        name: str = "Known Person Greeting Manager",
+    ) -> None:
+        super().__init__(name=name)
+
+        self.node = node
+        self.client = ActionClient(
+            node,
+            SpeakText,
+            "/voice/speak",
+        )
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        for key in [
+            BlackboardKey.PERCEPTION_LAST_EVENT,
+            BlackboardKey.PERCEPTION_EVENT_IDENTITY,
+            BlackboardKey.PERCEPTION_EVENT_RELATIONSHIP,
+            BlackboardKey.PERCEPTION_EVENT_PREFERRED_ADDRESS,
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            BlackboardKey.DIALOGUE_STATE,
+            BlackboardKey.DIALOGUE_COMMAND,
+            BlackboardKey.DIALOGUE_INTENT,
+            BlackboardKey.DIALOGUE_INTENT_CONFIDENCE,
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+            BlackboardKey.DIALOGUE_STOP_LISTENING_REQUESTED,
+            BlackboardKey.DIALOGUE_ERROR,
+            BlackboardKey.AUDIO_HEARD_TEXT,
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            BlackboardKey.AUDIO_IS_TALKING,
+            BlackboardKey.AUDIO_HOTWORD_DETECTED,
+            BlackboardKey.AUDIO_LAST_EVENT,
+        ]:
+            register_read_write(
+                self.blackboard,
+                key,
+            )
+
+        self._greeted_identities: set[str] = set()
+        self._pending_greetings: list[dict[str, str]] = []
+
+        self._goal_future = None
+        self._goal_handle = None
+        self._result_future = None
+        self._current_greeting = None
+
+        self._conversation_was_active = bool(
+            self.blackboard.get(
+                BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
+            )
+        )
+
+    def _queue_recognition_event(self) -> None:
+        event = self.blackboard.get(
+            BlackboardKey.PERCEPTION_LAST_EVENT
+        )
+
+        if event != "KNOWN_PERSON_APPEARED":
+            return
+
+        identity = self.blackboard.get(
+            BlackboardKey.PERCEPTION_EVENT_IDENTITY
+        ).strip()
+
+        if not identity:
+            return
+
+        if identity in self._greeted_identities:
+            return
+
+        if (
+            self._current_greeting is not None
+            and self._current_greeting["identity"] == identity
+        ):
+            return
+
+        if any(
+            item["identity"] == identity
+            for item in self._pending_greetings
+        ):
+            return
+
+        active = bool(
+            self.blackboard.get(
+                BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
+            )
+        )
+
+        desired_mode = self.blackboard.get(
+            BlackboardKey.AUDIO_DESIRED_MODE
+        )
+
+        # An explicit NOT_LISTENING selection remains authoritative.
+        if (
+            not active
+            and desired_mode == AudioMode.NOT_LISTENING
+        ):
+            self.node.get_logger().debug(
+                f"Known person '{identity}' appeared while NOT_LISTENING; "
+                "automatic greeting suppressed"
+            )
+            return
+
+        relationship = self.blackboard.get(
+            BlackboardKey.PERCEPTION_EVENT_RELATIONSHIP
+        ).strip().lower()
+
+        preferred_address = self.blackboard.get(
+            BlackboardKey.PERCEPTION_EVENT_PREFERRED_ADDRESS
+        ).strip()
+
+        self._pending_greetings.append(
+            {
+                "identity": identity,
+                "relationship": relationship,
+                "preferred_address": preferred_address,
+            }
+        )
+
+        self.node.get_logger().info(
+            f"Queued greeting for recognised person '{identity}'"
+        )
+
+    def _handle_session_boundary(self) -> bool:
+        active = bool(
+            self.blackboard.get(
+                BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
+            )
+        )
+
+        if (
+            self._conversation_was_active
+            and not active
+        ):
+            if self._greeted_identities:
+                self.node.get_logger().debug(
+                    "Conversation ended; clearing greeted identities: "
+                    + ", ".join(
+                        sorted(self._greeted_identities)
+                    )
+                )
+
+            self._greeted_identities.clear()
+            self._pending_greetings.clear()
+
+            # A recognition greeting is deliberately not allowed to resurrect a
+            # conversation after STOP_LISTENING unless a fresh recognition
+            # transition occurs.
+            if self._current_greeting is None:
+                self._reset_action_state()
+
+        self._conversation_was_active = active
+        return active
+
+    def _dialogue_is_idle(self) -> bool:
+        if self.blackboard.get(
+            BlackboardKey.DIALOGUE_STATE
+        ) != DialogueState.IDLE:
+            return False
+
+        if self.blackboard.get(
+            BlackboardKey.DIALOGUE_COMMAND
+        ).strip():
+            return False
+
+        if self.blackboard.get(
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE
+        ).strip():
+            return False
+
+        if bool(
+            self.blackboard.get(
+                BlackboardKey.AUDIO_IS_TALKING
+            )
+        ):
+            return False
+
+        return True
+
+    def _start_conversation_if_needed(self) -> bool:
+        active = bool(
+            self.blackboard.get(
+                BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
+            )
+        )
+
+        if active:
+            return True
+
+        desired_mode = self.blackboard.get(
+            BlackboardKey.AUDIO_DESIRED_MODE
+        )
+
+        if desired_mode == AudioMode.NOT_LISTENING:
+            return False
+
+        clear_dialogue_turn(
+            self.blackboard
+        )
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
+            True,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.AUDIO_DESIRED_MODE,
+            AudioMode.LISTENING,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.AUDIO_HOTWORD_DETECTED,
+            False,
+            overwrite=True,
+        )
+        self.blackboard.set(
+            BlackboardKey.AUDIO_LAST_EVENT,
+            "KNOWN_PERSON_STARTED_CONVERSATION",
+            overwrite=True,
+        )
+
+        self._conversation_was_active = True
+
+        self.node.get_logger().info(
+            "Recognised person started a conversation; requested LISTENING"
+        )
+
+        return True
+
+    @staticmethod
+    def _greeting_text(
+        greeting: dict[str, str],
+    ) -> str:
+        identity = greeting["identity"]
+        relationship = greeting["relationship"]
+        preferred_address = greeting["preferred_address"]
+
+        if (
+            relationship == "family"
+            and preferred_address
+        ):
+            address = preferred_address
+        else:
+            address = identity
+
+        return f"Greetings, {address}."
+
+    def _start_greeting(
+        self,
+        greeting: dict[str, str],
+    ) -> bool:
+        if not self.client.server_is_ready():
+            self.feedback_message = (
+                "waiting for /voice/speak before greeting"
+            )
+            return False
+
+        goal = SpeakText.Goal()
+        goal.text = self._greeting_text(
+            greeting
+        )
+        goal.owner = "recognition_greeting"
+        goal.priority = 90
+        goal.interrupt_lower_priority = False
+        goal.clear_lower_priority = False
+
+        self._current_greeting = greeting
+        self._goal_future = self.client.send_goal_async(
+            goal
+        )
+        self._goal_handle = None
+        self._result_future = None
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_STATE,
+            DialogueState.WAITING_TO_SPEAK,
+            overwrite=True,
+        )
+
+        self.feedback_message = (
+            f"submitted greeting for {greeting['identity']}"
+        )
+        return True
+
+    def _reset_action_state(self) -> None:
+        self._goal_future = None
+        self._goal_handle = None
+        self._result_future = None
+        self._current_greeting = None
+
+    def _update_active_greeting(self) -> None:
+        if self._current_greeting is None:
+            return
+
+        if self._goal_handle is None:
+            if (
+                self._goal_future is None
+                or not self._goal_future.done()
+            ):
+                self.feedback_message = "waiting for greeting acceptance"
+                return
+
+            try:
+                self._goal_handle = self._goal_future.result()
+            except Exception as exc:
+                self.node.get_logger().warning(
+                    f"Greeting speech goal failed: {exc}"
+                )
+                self.blackboard.set(
+                    BlackboardKey.DIALOGUE_STATE,
+                    DialogueState.IDLE,
+                    overwrite=True,
+                )
+                self._pending_greetings.pop(0)
+                self._reset_action_state()
+                return
+
+            if (
+                self._goal_handle is None
+                or not self._goal_handle.accepted
+            ):
+                self.node.get_logger().warning(
+                    "Greeting speech goal was rejected"
+                )
+                self.blackboard.set(
+                    BlackboardKey.DIALOGUE_STATE,
+                    DialogueState.IDLE,
+                    overwrite=True,
+                )
+                self._pending_greetings.pop(0)
+                self._reset_action_state()
+                return
+
+            self._result_future = (
+                self._goal_handle.get_result_async()
+            )
+
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_STATE,
+                DialogueState.SPEAKING,
+                overwrite=True,
+            )
+
+            self.feedback_message = (
+                f"greeting {self._current_greeting['identity']}"
+            )
+            return
+
+        if (
+            self._result_future is None
+            or not self._result_future.done()
+        ):
+            self.feedback_message = (
+                f"greeting {self._current_greeting['identity']}"
+            )
+            return
+
+        identity = self._current_greeting["identity"]
+
+        try:
+            wrapped_result = self._result_future.result()
+            result = wrapped_result.result
+            success = bool(
+                result.success
+            )
+            message = result.message
+
+        except Exception as exc:
+            success = False
+            message = str(exc)
+
+        conversation_active = bool(
+            self.blackboard.get(
+                BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
+            )
+        )
+
+        if success and conversation_active:
+            self._greeted_identities.add(
+                identity
+            )
+
+            self.node.get_logger().info(
+                f"Greeted recognised person '{identity}'"
+            )
+        elif success:
+            self.node.get_logger().debug(
+                f"Greeting for '{identity}' completed after conversation ended; "
+                "not recording it in the new-session greeted set"
+            )
+        else:
+            self.node.get_logger().warning(
+                f"Greeting for '{identity}' failed: {message}"
+            )
+
+        if self._pending_greetings:
+            self._pending_greetings.pop(0)
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_STATE,
+            DialogueState.IDLE,
+            overwrite=True,
+        )
+
+        self._reset_action_state()
+        self.feedback_message = (
+            f"greeting complete for {identity}"
+            if success
+            else f"greeting failed for {identity}"
+        )
+
+    def update(self) -> py_trees.common.Status:
+        # Apply a just-ended conversation boundary before consuming any fresh
+        # recognition event from this BT tick.
+        self._handle_session_boundary()
+        self._queue_recognition_event()
+
+        if self._current_greeting is not None:
+            # If a panel action ended the conversation while a greeting was
+            # already speaking, let the speech action finish but do not start
+            # any further queued greeting.
+            self._update_active_greeting()
+            return py_trees.common.Status.RUNNING
+
+        if not self._pending_greetings:
+            self.feedback_message = (
+                "no recognised person awaiting greeting"
+            )
+            return py_trees.common.Status.RUNNING
+
+        if not self._dialogue_is_idle():
+            self.feedback_message = (
+                "recognised greeting queued; dialogue busy"
+            )
+            return py_trees.common.Status.RUNNING
+
+        if not self._start_conversation_if_needed():
+            self._pending_greetings.clear()
+            self.feedback_message = (
+                "automatic greeting suppressed by NOT_LISTENING"
+            )
+            return py_trees.common.Status.RUNNING
+
+        # Starting conversation clears the transient dialogue fields; it is now
+        # safe to submit a deterministic greeting without involving the LLM.
+        self._start_greeting(
+            self._pending_greetings[0]
+        )
+
+        return py_trees.common.Status.RUNNING
+
 
 # ---------------------------------------------------------------------------
 # Audio state arbitration
@@ -2653,7 +3175,11 @@ def create_perception_state_manager(
 ) -> py_trees.behaviour.Behaviour:
     return ProcessPerceptionEvents(node)
 
-    return perception_manager
+
+def create_known_person_greeting_manager(
+    node: Node,
+) -> py_trees.behaviour.Behaviour:
+    return KnownPersonGreetingManager(node)
 
 
 def create_dialogue_manager(
@@ -2739,7 +3265,7 @@ def create_dialogue_manager(
     # WaitForCommand, then handles exactly one interpreted utterance.
     conversation = py_trees.composites.Sequence(
         name="Active Conversation",
-        memory=True,
+        memory=False,
     )
     conversation.add_children(
         [
@@ -2831,6 +3357,7 @@ def create_tree(node: Node) -> py_trees.behaviour.Behaviour:
         [
             create_audio_state_manager(node),
             create_perception_state_manager(node),
+            create_known_person_greeting_manager(node),
             create_dialogue_manager(node),
             create_chess_manager(),
             create_expression_manager(),
