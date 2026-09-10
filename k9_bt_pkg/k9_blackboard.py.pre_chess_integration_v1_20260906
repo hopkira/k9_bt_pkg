@@ -62,7 +62,6 @@ class ChessState:
     IDLE = "IDLE"
     SETUP = "SETUP"
     STARTING = "STARTING"
-    WAITING_FOR_CHALLENGE = "WAITING_FOR_CHALLENGE"
     ACTIVE = "ACTIVE"
     SUSPENDED = "SUSPENDED"
     FINISHED = "FINISHED"
@@ -163,8 +162,6 @@ class BlackboardKey:
     CHESS_STATE = "chess/state"
     CHESS_SETUP_STEP = "chess/setup_step"
     CHESS_PLAYER_NAME = "chess/player_name"
-    CHESS_HUMAN_COLOUR = "chess/human_colour"
-    CHESS_K9_COLOUR = "chess/k9_colour"
     CHESS_PREFERRED_COLOUR = "chess/preferred_colour"
     CHESS_GAME_ID = "chess/game_id"
     CHESS_GAME_ACTIVE = "chess/game_active"
@@ -174,14 +171,6 @@ class BlackboardKey:
     CHESS_LAST_MOVE = "chess/last_move"
     CHESS_RESULT = "chess/result"
     CHESS_ERROR = "chess/error"
-    CHESS_FEN = "chess/fen"
-    CHESS_PLY = "chess/ply"
-    CHESS_ENGINE_BUSY = "chess/engine_busy"
-    CHESS_EVALUATION_VALID = "chess/evaluation_valid"
-    CHESS_EVALUATION_PAWNS = "chess/evaluation_pawns"
-    CHESS_EVALUATION_IS_MATE = "chess/evaluation_is_mate"
-    CHESS_MATE_IN = "chess/mate_in"
-    CHESS_LAST_EVENT = "chess/last_event"
 
     # Physical expression requested by the executive
     EXPRESSION_DESIRED = "expression/desired"
@@ -548,18 +537,6 @@ K9_BLACKBOARD_FIELDS: tuple[BlackboardField, ...] = (
         "Player name captured during setup.",
     ),
     BlackboardField(
-        BlackboardKey.CHESS_HUMAN_COLOUR,
-        str,
-        "",
-        "Human colour reported by Lichess.",
-    ),
-    BlackboardField(
-        BlackboardKey.CHESS_K9_COLOUR,
-        str,
-        "",
-        "K9 colour reported by Lichess.",
-    ),
-    BlackboardField(
         BlackboardKey.CHESS_PREFERRED_COLOUR,
         str,
         "RANDOM",
@@ -612,54 +589,6 @@ K9_BLACKBOARD_FIELDS: tuple[BlackboardField, ...] = (
         str,
         "",
         "Most recent chess subsystem error.",
-    ),
-    BlackboardField(
-        BlackboardKey.CHESS_FEN,
-        str,
-        "",
-        "Authoritative current chess position in FEN.",
-    ),
-    BlackboardField(
-        BlackboardKey.CHESS_PLY,
-        int,
-        0,
-        "Number of half-moves in the current chess game.",
-    ),
-    BlackboardField(
-        BlackboardKey.CHESS_ENGINE_BUSY,
-        bool,
-        False,
-        "Whether the chess engine is currently computing.",
-    ),
-    BlackboardField(
-        BlackboardKey.CHESS_EVALUATION_VALID,
-        bool,
-        False,
-        "Whether a normal pawn evaluation is available.",
-    ),
-    BlackboardField(
-        BlackboardKey.CHESS_EVALUATION_PAWNS,
-        float,
-        0.0,
-        "Stockfish evaluation in pawns from K9's perspective.",
-    ),
-    BlackboardField(
-        BlackboardKey.CHESS_EVALUATION_IS_MATE,
-        bool,
-        False,
-        "Whether the current evaluation is a forced-mate score.",
-    ),
-    BlackboardField(
-        BlackboardKey.CHESS_MATE_IN,
-        int,
-        0,
-        "Signed mate distance from K9's perspective.",
-    ),
-    BlackboardField(
-        BlackboardKey.CHESS_LAST_EVENT,
-        str,
-        "",
-        "Most recent chess event consumed by the executive.",
     ),
 
     # Expression

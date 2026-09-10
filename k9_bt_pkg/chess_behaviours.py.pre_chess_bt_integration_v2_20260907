@@ -1,0 +1,1103 @@
+#!/usr/bin/env python3
+"""Chess behaviours for the central K9 behaviour tree.
+
+Chess is deliberately an overlay on K9's persistent conversation rather than a
+separate operating mode.  This module provides:
+
+* BeginChessSetup
+    Handles PLAY_CHESS.  It uses an attended/uniquely recognised face when one
+    is available, otherwise asks who K9 is playing.
+
+* ContinueChessSetup
+    Handles a later CHESS_SETUP_ANSWER without monopolising the conversation
+    branch while K9 is waiting for the answer.
+
+* ChessRuntimeManager
+    Mirrors /chess/status onto the K9 blackboard and reacts to /chess/event.
+    It never blocks normal conversation.  Chess move announcements use lower
+    speech priorities than ordinary dialogue, so conversation can pre-empt
+    them.
+
+The chess subsystem remains authoritative for board facts.  These behaviours
+only coordinate executive state, speech and simple physical reactions.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import json
+import re
+import threading
+from typing import Deque, Optional
+
+import py_trees
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+
+from k9_interfaces_pkg.action import SpeakText
+from k9_interfaces_pkg.msg import ChessEvent, ChessStatus
+from k9_interfaces_pkg.srv import StartChessGame
+
+try:
+    from k9_bt_pkg.k9_blackboard import (
+        BlackboardKey,
+        ChessSetupStep,
+        ChessState,
+        DialogueState,
+        Intent,
+    )
+except ModuleNotFoundError:
+    from k9_blackboard import (
+        BlackboardKey,
+        ChessSetupStep,
+        ChessState,
+        DialogueState,
+        Intent,
+    )
+
+
+# Chess setup speech should yield to ordinary dialogue and urgent social speech.
+CHESS_SETUP_SPEECH_PRIORITY = 80
+
+# Move instructions should be audible but must not monopolise conversation.
+CHESS_MOVE_SPEECH_PRIORITY = 50
+
+# "Your move" is useful but deliberately very low priority.
+CHESS_TURN_SPEECH_PRIORITY = 20
+
+# End-of-game speech should normally be heard, while still yielding to higher
+# priority executive dialogue.
+CHESS_RESULT_SPEECH_PRIORITY = 70
+
+
+def _register_read_write(
+    blackboard: py_trees.blackboard.Client,
+    key: str,
+) -> None:
+    blackboard.register_key(
+        key=key,
+        access=py_trees.common.Access.READ,
+    )
+    blackboard.register_key(
+        key=key,
+        access=py_trees.common.Access.WRITE,
+    )
+
+
+def _title_words(text: str) -> str:
+    return " ".join(
+        part[:1].upper() + part[1:]
+        for part in text.split()
+    )
+
+
+def _extract_name(text: str) -> str:
+    """Extract a short human name from a chess setup reply."""
+
+    cleaned = text.strip(" \t\r\n.,!?")
+
+    patterns = [
+        r"(?i)\bmy name is\s+([a-z][a-z' -]{0,40})$",
+        r"(?i)\bi am\s+([a-z][a-z' -]{0,40})$",
+        r"(?i)\bi'm\s+([a-z][a-z' -]{0,40})$",
+        r"(?i)\bcall me\s+([a-z][a-z' -]{0,40})$",
+        r"(?i)\byou are playing\s+([a-z][a-z' -]{0,40})$",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            return _title_words(
+                re.sub(r"\s+", " ", match.group(1)).strip()
+            )
+
+    if "?" not in text:
+        words = re.findall(
+            r"[A-Za-z][A-Za-z'-]*",
+            cleaned,
+        )
+        if 1 <= len(words) <= 3 and len(cleaned) <= 40:
+            return _title_words(" ".join(words))
+
+    return ""
+
+
+class _ChessDialogueBase(py_trees.behaviour.Behaviour):
+    """Shared asynchronous speech/service machinery for chess setup leaves."""
+
+    def __init__(
+        self,
+        *,
+        node: Node,
+        name: str,
+    ) -> None:
+        super().__init__(name=name)
+        self.node = node
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        for key in [
+            BlackboardKey.DIALOGUE_COMMAND,
+            BlackboardKey.DIALOGUE_INTENT,
+            BlackboardKey.DIALOGUE_STATE,
+            BlackboardKey.DIALOGUE_ERROR,
+            BlackboardKey.CHESS_STATE,
+            BlackboardKey.CHESS_SETUP_STEP,
+            BlackboardKey.CHESS_PLAYER_NAME,
+            BlackboardKey.CHESS_GAME_ACTIVE,
+            BlackboardKey.CHESS_ERROR,
+            BlackboardKey.PERCEPTION_ATTENDED_PERSON,
+            BlackboardKey.PERCEPTION_VISIBLE_IDENTITIES,
+        ]:
+            _register_read_write(
+                self.blackboard,
+                key,
+            )
+
+        self.start_client = node.create_client(
+            StartChessGame,
+            "/chess/start_game",
+        )
+        self.speech_client = ActionClient(
+            node,
+            SpeakText,
+            "/voice/speak",
+        )
+        self.intent_context_publisher = node.create_publisher(
+            String,
+            "/intent/context",
+            10,
+        )
+
+        self.phase = "IDLE"
+        self.player_name = ""
+        self.service_future = None
+
+        self.speech_goal_future = None
+        self.speech_goal_handle = None
+        self.speech_result_future = None
+
+    def _publish_setup_context(
+        self,
+        *,
+        waiting_for_name: bool,
+    ) -> None:
+        if waiting_for_name:
+            payload = {
+                "chess_state": "SETUP",
+                "chess_setup_step": "WAIT_NAME",
+            }
+        else:
+            payload = {}
+
+        self.intent_context_publisher.publish(
+            String(
+                data=json.dumps(
+                    payload,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        )
+
+    def _known_player_name(self) -> str:
+        """Use social attention first, then one unambiguous recognised face."""
+
+        attended = str(
+            self.blackboard.get(
+                BlackboardKey.PERCEPTION_ATTENDED_PERSON
+            )
+            or ""
+        ).strip()
+
+        if attended:
+            return attended
+
+        visible = self.blackboard.get(
+            BlackboardKey.PERCEPTION_VISIBLE_IDENTITIES
+        )
+
+        names = sorted(
+            {
+                str(name).strip()
+                for name in (visible or [])
+                if str(name).strip()
+            }
+        )
+
+        if len(names) == 1:
+            return names[0]
+
+        return ""
+
+    def _request_game_start(self) -> bool:
+        """Start the asynchronous StartChessGame call when the service is ready."""
+
+        if self.service_future is not None:
+            return True
+
+        if not self.start_client.service_is_ready():
+            self.feedback_message = "waiting for /chess/start_game"
+            return False
+
+        request = StartChessGame.Request()
+        request.player_name = self.player_name
+
+        self.service_future = self.start_client.call_async(
+            request
+        )
+
+        self.blackboard.set(
+            BlackboardKey.CHESS_SETUP_STEP,
+            ChessSetupStep.START_GAME,
+            overwrite=True,
+        )
+
+        self.feedback_message = (
+            f"arming chess for {self.player_name}"
+        )
+        return True
+
+    def _game_start_result(self) -> Optional[bool]:
+        """Return None while waiting, otherwise success/failure."""
+
+        if self.service_future is None:
+            return None
+
+        if not self.service_future.done():
+            self.feedback_message = (
+                f"waiting for chess manager to arm for {self.player_name}"
+            )
+            return None
+
+        try:
+            response = self.service_future.result()
+        except Exception as exc:
+            self.blackboard.set(
+                BlackboardKey.CHESS_ERROR,
+                f"/chess/start_game failed: {exc}",
+                overwrite=True,
+            )
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_ERROR,
+                f"/chess/start_game failed: {exc}",
+                overwrite=True,
+            )
+            return False
+
+        if not response.success:
+            error = (
+                response.message
+                or "Chess manager rejected the start request"
+            )
+            self.blackboard.set(
+                BlackboardKey.CHESS_ERROR,
+                error,
+                overwrite=True,
+            )
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_ERROR,
+                error,
+                overwrite=True,
+            )
+            return False
+
+        self.blackboard.set(
+            BlackboardKey.CHESS_SETUP_STEP,
+            ChessSetupStep.NONE,
+            overwrite=True,
+        )
+        return True
+
+    def _start_speech(
+        self,
+        text: str,
+    ) -> bool:
+        if not self.speech_client.server_is_ready():
+            self.feedback_message = "waiting for /voice/speak"
+            return False
+
+        goal = SpeakText.Goal()
+        goal.text = text
+        goal.owner = "chess_setup"
+        goal.priority = CHESS_SETUP_SPEECH_PRIORITY
+        goal.interrupt_lower_priority = True
+        goal.clear_lower_priority = False
+
+        self.speech_goal_future = (
+            self.speech_client.send_goal_async(goal)
+        )
+        self.speech_goal_handle = None
+        self.speech_result_future = None
+
+        self.feedback_message = text
+        return True
+
+    def _speech_finished(self) -> Optional[bool]:
+        """Return None while speaking, else whether speech completed normally."""
+
+        if self.speech_goal_future is None:
+            return False
+
+        if self.speech_goal_handle is None:
+            if not self.speech_goal_future.done():
+                return None
+
+            try:
+                handle = self.speech_goal_future.result()
+            except Exception as exc:
+                self.blackboard.set(
+                    BlackboardKey.DIALOGUE_ERROR,
+                    f"Chess setup speech failed: {exc}",
+                    overwrite=True,
+                )
+                return False
+
+            if not handle.accepted:
+                self.blackboard.set(
+                    BlackboardKey.DIALOGUE_ERROR,
+                    "Chess setup speech goal rejected",
+                    overwrite=True,
+                )
+                return False
+
+            self.speech_goal_handle = handle
+            self.speech_result_future = handle.get_result_async()
+            return None
+
+        if not self.speech_result_future.done():
+            return None
+
+        try:
+            wrapped = self.speech_result_future.result()
+            result = wrapped.result
+        except Exception as exc:
+            self.blackboard.set(
+                BlackboardKey.DIALOGUE_ERROR,
+                f"Chess setup speech result failed: {exc}",
+                overwrite=True,
+            )
+            return False
+
+        return bool(result.success)
+
+
+class BeginChessSetup(_ChessDialogueBase):
+    """Handle PLAY_CHESS without blocking later ordinary conversation turns."""
+
+    def __init__(
+        self,
+        *,
+        node: Node,
+        name: str = "Begin Chess Setup",
+    ) -> None:
+        super().__init__(
+            node=node,
+            name=name,
+        )
+
+    def initialise(self) -> None:
+        self.phase = "PREPARE"
+        self.player_name = ""
+        self.service_future = None
+        self.speech_goal_future = None
+        self.speech_goal_handle = None
+        self.speech_result_future = None
+
+    def update(self) -> py_trees.common.Status:
+        if self.phase == "PREPARE":
+            current_state = str(
+                self.blackboard.get(
+                    BlackboardKey.CHESS_STATE
+                )
+                or ""
+            ).upper()
+
+            if current_state in {
+                "WAITING_FOR_CHALLENGE",
+                "ACTIVE",
+                "SUSPENDED",
+                "STARTING",
+            }:
+                if self._start_speech(
+                    "We already have a chess game in progress."
+                ):
+                    self.phase = "SPEAK_ALREADY_ACTIVE"
+                return py_trees.common.Status.RUNNING
+
+            self.player_name = self._known_player_name()
+
+            self.blackboard.set(
+                BlackboardKey.CHESS_STATE,
+                ChessState.SETUP,
+                overwrite=True,
+            )
+
+            if self.player_name:
+                self.blackboard.set(
+                    BlackboardKey.CHESS_PLAYER_NAME,
+                    self.player_name,
+                    overwrite=True,
+                )
+                self._publish_setup_context(
+                    waiting_for_name=False
+                )
+                self.phase = "START_GAME"
+            else:
+                self.blackboard.set(
+                    BlackboardKey.CHESS_SETUP_STEP,
+                    ChessSetupStep.WAIT_PLAYER_NAME,
+                    overwrite=True,
+                )
+                self._publish_setup_context(
+                    waiting_for_name=True
+                )
+                if self._start_speech(
+                    "Who am I playing?"
+                ):
+                    self.phase = "SPEAK_ASK_NAME"
+
+            return py_trees.common.Status.RUNNING
+
+        if self.phase == "SPEAK_ASK_NAME":
+            complete = self._speech_finished()
+            if complete is None:
+                return py_trees.common.Status.RUNNING
+
+            # Deliberately leave the intent chess setup context in WAIT_NAME.
+            # The next unrelated utterance can still be GENERAL_CONVERSATION;
+            # a valid name will be classified as CHESS_SETUP_ANSWER.
+            self.feedback_message = "waiting for player name on a later turn"
+            return py_trees.common.Status.SUCCESS
+
+        if self.phase == "START_GAME":
+            if not self._request_game_start():
+                return py_trees.common.Status.RUNNING
+
+            started = self._game_start_result()
+            if started is None:
+                return py_trees.common.Status.RUNNING
+
+            if not started:
+                if self._start_speech(
+                    "I cannot start the chess game at present."
+                ):
+                    self.phase = "SPEAK_START_FAILED"
+                return py_trees.common.Status.RUNNING
+
+            text = (
+                f"Affirmative, {self.player_name}. "
+                "Please start the game against me in the Phantom application."
+            )
+            if self._start_speech(text):
+                self.phase = "SPEAK_PHANTOM_PROMPT"
+            return py_trees.common.Status.RUNNING
+
+        if self.phase in {
+            "SPEAK_ALREADY_ACTIVE",
+            "SPEAK_START_FAILED",
+            "SPEAK_PHANTOM_PROMPT",
+        }:
+            complete = self._speech_finished()
+            if complete is None:
+                return py_trees.common.Status.RUNNING
+
+            self._publish_setup_context(
+                waiting_for_name=False
+            )
+            return py_trees.common.Status.SUCCESS
+
+        self.feedback_message = f"unexpected phase {self.phase}"
+        return py_trees.common.Status.FAILURE
+
+
+class ContinueChessSetup(_ChessDialogueBase):
+    """Handle CHESS_SETUP_ANSWER on a later conversational turn."""
+
+    def __init__(
+        self,
+        *,
+        node: Node,
+        name: str = "Continue Chess Setup",
+    ) -> None:
+        super().__init__(
+            node=node,
+            name=name,
+        )
+
+    def initialise(self) -> None:
+        self.phase = "READ_NAME"
+        self.player_name = ""
+        self.service_future = None
+        self.speech_goal_future = None
+        self.speech_goal_handle = None
+        self.speech_result_future = None
+
+    def update(self) -> py_trees.common.Status:
+        if self.phase == "READ_NAME":
+            setup_step = str(
+                self.blackboard.get(
+                    BlackboardKey.CHESS_SETUP_STEP
+                )
+                or ""
+            ).upper()
+
+            if setup_step not in {
+                "WAIT_PLAYER_NAME",
+                "WAIT_NAME",
+            }:
+                self.feedback_message = (
+                    f"not waiting for a chess player name: {setup_step}"
+                )
+                return py_trees.common.Status.FAILURE
+
+            command = str(
+                self.blackboard.get(
+                    BlackboardKey.DIALOGUE_COMMAND
+                )
+                or ""
+            ).strip()
+
+            self.player_name = _extract_name(command)
+
+            if not self.player_name:
+                self._publish_setup_context(
+                    waiting_for_name=True
+                )
+                if self._start_speech(
+                    "I did not catch the name. Who am I playing?"
+                ):
+                    self.phase = "SPEAK_RETRY"
+                return py_trees.common.Status.RUNNING
+
+            self.blackboard.set(
+                BlackboardKey.CHESS_PLAYER_NAME,
+                self.player_name,
+                overwrite=True,
+            )
+            self._publish_setup_context(
+                waiting_for_name=False
+            )
+            self.phase = "START_GAME"
+
+        if self.phase == "START_GAME":
+            if not self._request_game_start():
+                return py_trees.common.Status.RUNNING
+
+            started = self._game_start_result()
+            if started is None:
+                return py_trees.common.Status.RUNNING
+
+            if not started:
+                if self._start_speech(
+                    "I cannot start the chess game at present."
+                ):
+                    self.phase = "SPEAK_START_FAILED"
+                return py_trees.common.Status.RUNNING
+
+            text = (
+                f"Affirmative, {self.player_name}. "
+                "Please start the game against me in the Phantom application."
+            )
+            if self._start_speech(text):
+                self.phase = "SPEAK_PHANTOM_PROMPT"
+            return py_trees.common.Status.RUNNING
+
+        if self.phase == "SPEAK_RETRY":
+            complete = self._speech_finished()
+            if complete is None:
+                return py_trees.common.Status.RUNNING
+
+            # Keep waiting for another later CHESS_SETUP_ANSWER.
+            self.blackboard.set(
+                BlackboardKey.CHESS_SETUP_STEP,
+                ChessSetupStep.WAIT_PLAYER_NAME,
+                overwrite=True,
+            )
+            self._publish_setup_context(
+                waiting_for_name=True
+            )
+            return py_trees.common.Status.SUCCESS
+
+        if self.phase in {
+            "SPEAK_START_FAILED",
+            "SPEAK_PHANTOM_PROMPT",
+        }:
+            complete = self._speech_finished()
+            if complete is None:
+                return py_trees.common.Status.RUNNING
+
+            return py_trees.common.Status.SUCCESS
+
+        self.feedback_message = f"unexpected phase {self.phase}"
+        return py_trees.common.Status.FAILURE
+
+
+class ChessRuntimeManager(py_trees.behaviour.Behaviour):
+    """Mirror chess ROS state and react to chess events without blocking dialogue."""
+
+    def __init__(
+        self,
+        node: Node,
+        name: str = "Chess Runtime Manager",
+    ) -> None:
+        super().__init__(name=name)
+        self.node = node
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        for key in [
+            BlackboardKey.CHESS_STATE,
+            BlackboardKey.CHESS_SETUP_STEP,
+            BlackboardKey.CHESS_PLAYER_NAME,
+            BlackboardKey.CHESS_HUMAN_COLOUR,
+            BlackboardKey.CHESS_K9_COLOUR,
+            BlackboardKey.CHESS_GAME_ID,
+            BlackboardKey.CHESS_GAME_ACTIVE,
+            BlackboardKey.CHESS_GAME_SUSPENDED,
+            BlackboardKey.CHESS_SIDE_TO_MOVE,
+            BlackboardKey.CHESS_PENDING_MOVE,
+            BlackboardKey.CHESS_LAST_MOVE,
+            BlackboardKey.CHESS_RESULT,
+            BlackboardKey.CHESS_ERROR,
+            BlackboardKey.CHESS_FEN,
+            BlackboardKey.CHESS_PLY,
+            BlackboardKey.CHESS_ENGINE_BUSY,
+            BlackboardKey.CHESS_EVALUATION_VALID,
+            BlackboardKey.CHESS_EVALUATION_PAWNS,
+            BlackboardKey.CHESS_EVALUATION_IS_MATE,
+            BlackboardKey.CHESS_MATE_IN,
+            BlackboardKey.CHESS_LAST_EVENT,
+        ]:
+            _register_read_write(
+                self.blackboard,
+                key,
+            )
+
+        status_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        self._lock = threading.Lock()
+        self._latest_status = None
+        self._status_dirty = False
+        self._events: Deque[dict] = deque(
+            maxlen=32
+        )
+
+        self.status_subscription = node.create_subscription(
+            ChessStatus,
+            "/chess/status",
+            self._status_callback,
+            status_qos,
+        )
+        self.event_subscription = node.create_subscription(
+            ChessEvent,
+            "/chess/event",
+            self._event_callback,
+            30,
+        )
+
+        self.speech_client = ActionClient(
+            node,
+            SpeakText,
+            "/voice/speak",
+        )
+        self._speech_goal_future = None
+        self._speech_goal_handle = None
+        self._speech_result_future = None
+
+        self.tail_wag_v = node.create_client(
+            Trigger,
+            "/tail_wag_v",
+        )
+        self.tail_up = node.create_client(
+            Trigger,
+            "/tail_up",
+        )
+        self.tail_down = node.create_client(
+            Trigger,
+            "/tail_down",
+        )
+        self.tail_centre = node.create_client(
+            Trigger,
+            "/tail_centre",
+        )
+
+    # ------------------------------------------------------------------
+    # ROS callbacks only cache state; blackboard mutation happens in update().
+    # ------------------------------------------------------------------
+
+    def _status_callback(
+        self,
+        msg: ChessStatus,
+    ) -> None:
+        status = {
+            "state": msg.state,
+            "player_name": msg.player_name,
+            "human_colour": msg.human_colour,
+            "k9_colour": msg.k9_colour,
+            "game_id": msg.game_id,
+            "game_active": bool(msg.game_active),
+            "game_suspended": bool(msg.game_suspended),
+            "side_to_move": msg.side_to_move,
+            "pending_move": msg.pending_move,
+            "last_move": msg.last_move,
+            "result": msg.result,
+            "error": msg.error,
+            "fen": msg.fen,
+            "ply": int(msg.ply),
+            "engine_busy": bool(msg.engine_busy),
+            "evaluation_valid": bool(msg.evaluation_valid),
+            "evaluation_pawns": float(msg.evaluation_pawns),
+            "evaluation_is_mate": bool(msg.evaluation_is_mate),
+            "mate_in": int(msg.mate_in),
+        }
+
+        with self._lock:
+            self._latest_status = status
+            self._status_dirty = True
+
+    def _event_callback(
+        self,
+        msg: ChessEvent,
+    ) -> None:
+        event = {
+            "type": msg.type,
+            "game_id": msg.game_id,
+            "player_name": msg.player_name,
+            "status": msg.status,
+            "colour": msg.colour,
+            "uci": msg.uci,
+            "san": msg.san,
+            "piece": msg.piece,
+            "from_square": msg.from_square,
+            "to_square": msg.to_square,
+            "captured_piece": msg.captured_piece,
+            "gives_check": bool(msg.gives_check),
+            "gives_mate": bool(msg.gives_mate),
+            "source": msg.source,
+            "evaluation_before_valid": bool(
+                msg.evaluation_before_valid
+            ),
+            "evaluation_before_pawns": float(
+                msg.evaluation_before_pawns
+            ),
+            "evaluation_after_valid": bool(
+                msg.evaluation_after_valid
+            ),
+            "evaluation_after_pawns": float(
+                msg.evaluation_after_pawns
+            ),
+            "evaluation_delta_pawns": float(
+                msg.evaluation_delta_pawns
+            ),
+            "is_mate": bool(msg.is_mate),
+            "mate_in": int(msg.mate_in),
+            "speech_hint": msg.speech_hint,
+            "message": msg.message,
+        }
+
+        with self._lock:
+            self._events.append(event)
+
+    # ------------------------------------------------------------------
+    # Blackboard/status handling
+    # ------------------------------------------------------------------
+
+    def _apply_status(
+        self,
+        status: dict,
+    ) -> None:
+        # While the BT is waiting for an unknown player's real name, the chess
+        # manager quite correctly still reports IDLE because it has not yet
+        # been armed.  Do not let that periodic IDLE status erase the local
+        # SETUP/WAIT_PLAYER_NAME conversational context.
+        current_setup_step = str(
+            self.blackboard.get(
+                BlackboardKey.CHESS_SETUP_STEP
+            )
+            or ""
+        ).upper()
+
+        local_name_setup = (
+            current_setup_step
+            in {
+                "WAIT_PLAYER_NAME",
+                "WAIT_NAME",
+            }
+            and str(status["state"]).upper() == "IDLE"
+        )
+
+        if not local_name_setup:
+            self.blackboard.set(
+                BlackboardKey.CHESS_STATE,
+                status["state"] or ChessState.IDLE,
+                overwrite=True,
+            )
+
+            if status["state"] not in {
+                ChessState.SETUP,
+            }:
+                self.blackboard.set(
+                    BlackboardKey.CHESS_SETUP_STEP,
+                    ChessSetupStep.NONE,
+                    overwrite=True,
+                )
+
+        if status["player_name"]:
+            self.blackboard.set(
+                BlackboardKey.CHESS_PLAYER_NAME,
+                status["player_name"],
+                overwrite=True,
+            )
+
+        mappings = [
+            (BlackboardKey.CHESS_HUMAN_COLOUR, "human_colour"),
+            (BlackboardKey.CHESS_K9_COLOUR, "k9_colour"),
+            (BlackboardKey.CHESS_GAME_ID, "game_id"),
+            (BlackboardKey.CHESS_GAME_ACTIVE, "game_active"),
+            (BlackboardKey.CHESS_GAME_SUSPENDED, "game_suspended"),
+            (BlackboardKey.CHESS_SIDE_TO_MOVE, "side_to_move"),
+            (BlackboardKey.CHESS_PENDING_MOVE, "pending_move"),
+            (BlackboardKey.CHESS_LAST_MOVE, "last_move"),
+            (BlackboardKey.CHESS_RESULT, "result"),
+            (BlackboardKey.CHESS_ERROR, "error"),
+            (BlackboardKey.CHESS_FEN, "fen"),
+            (BlackboardKey.CHESS_PLY, "ply"),
+            (BlackboardKey.CHESS_ENGINE_BUSY, "engine_busy"),
+            (BlackboardKey.CHESS_EVALUATION_VALID, "evaluation_valid"),
+            (BlackboardKey.CHESS_EVALUATION_PAWNS, "evaluation_pawns"),
+            (
+                BlackboardKey.CHESS_EVALUATION_IS_MATE,
+                "evaluation_is_mate",
+            ),
+            (BlackboardKey.CHESS_MATE_IN, "mate_in"),
+        ]
+
+        for key, field in mappings:
+            self.blackboard.set(
+                key,
+                status[field],
+                overwrite=True,
+            )
+
+    # ------------------------------------------------------------------
+    # Low-priority speech and expressions
+    # ------------------------------------------------------------------
+
+    def _speak(
+        self,
+        text: str,
+        *,
+        priority: int,
+    ) -> bool:
+        if not text:
+            return False
+
+        if not self.speech_client.server_is_ready():
+            self.node.get_logger().warning(
+                f"Dropping chess speech because /voice/speak is unavailable: "
+                f"{text!r}"
+            )
+            return False
+
+        goal = SpeakText.Goal()
+        goal.text = text
+        goal.owner = "chess_commentary"
+        goal.priority = int(priority)
+
+        # Ordinary conversation uses a higher priority and is allowed to
+        # pre-empt chess commentary.  Chess commentary itself must not clear
+        # or interrupt higher-priority dialogue.
+        goal.interrupt_lower_priority = False
+        goal.clear_lower_priority = False
+
+        self._speech_goal_future = (
+            self.speech_client.send_goal_async(goal)
+        )
+        self._speech_goal_handle = None
+        self._speech_result_future = None
+        return True
+
+    def _speech_busy(self) -> bool:
+        if self._speech_goal_future is None:
+            return False
+
+        if self._speech_goal_handle is None:
+            if not self._speech_goal_future.done():
+                return True
+
+            try:
+                handle = self._speech_goal_future.result()
+            except Exception as exc:
+                self.node.get_logger().warning(
+                    f"Chess speech goal failed: {exc}"
+                )
+                self._clear_speech()
+                return False
+
+            if not handle.accepted:
+                self._clear_speech()
+                return False
+
+            self._speech_goal_handle = handle
+            self._speech_result_future = handle.get_result_async()
+            return True
+
+        if not self._speech_result_future.done():
+            return True
+
+        self._clear_speech()
+        return False
+
+    def _clear_speech(self) -> None:
+        self._speech_goal_future = None
+        self._speech_goal_handle = None
+        self._speech_result_future = None
+
+    @staticmethod
+    def _trigger(
+        client,
+    ) -> None:
+        if client.service_is_ready():
+            client.call_async(
+                Trigger.Request()
+            )
+
+    def _react_to_event(
+        self,
+        event: dict,
+    ) -> None:
+        event_type = str(
+            event.get("type", "")
+        ).upper()
+
+        self.blackboard.set(
+            BlackboardKey.CHESS_LAST_EVENT,
+            event_type,
+            overwrite=True,
+        )
+
+        if event_type == "K9_MOVE_SELECTED":
+            if event.get("gives_mate"):
+                self._trigger(
+                    self.tail_wag_v
+                )
+            elif event.get("gives_check"):
+                self._trigger(
+                    self.tail_up
+                )
+
+            self._speak(
+                event.get("speech_hint", ""),
+                priority=CHESS_MOVE_SPEECH_PRIORITY,
+            )
+            return
+
+        if event_type == "YOUR_MOVE":
+            self._speak(
+                event.get("speech_hint", "") or "Your move.",
+                priority=CHESS_TURN_SPEECH_PRIORITY,
+            )
+            return
+
+        if event_type == "GAME_FINISHED":
+            result = str(
+                event.get("message", "")
+                or self.blackboard.get(
+                    BlackboardKey.CHESS_RESULT
+                )
+                or ""
+            ).upper()
+            k9_colour = str(
+                self.blackboard.get(
+                    BlackboardKey.CHESS_K9_COLOUR
+                )
+                or ""
+            ).upper()
+
+            winner = (
+                result.split(":", 1)[0]
+                if ":" in result
+                else ""
+            )
+
+            if winner in {"WHITE", "BLACK"}:
+                if winner == k9_colour:
+                    self._trigger(
+                        self.tail_wag_v
+                    )
+                else:
+                    self._trigger(
+                        self.tail_down
+                    )
+            else:
+                self._trigger(
+                    self.tail_centre
+                )
+
+            self._speak(
+                event.get("speech_hint", ""),
+                priority=CHESS_RESULT_SPEECH_PRIORITY,
+            )
+            return
+
+        # POSITION_EVALUATED, HUMAN_MOVE, K9_MOVE_SENT/CONFIRMED and engine
+        # activity are intentionally silent.  In particular ENGINE_THINKING is
+        # NOT mapped to /interaction/activity=PROCESSING because that would
+        # inhibit STT and stop the opponent chatting while Stockfish thinks.
+
+    def update(self) -> py_trees.common.Status:
+        status = None
+        event = None
+
+        with self._lock:
+            if self._status_dirty:
+                status = dict(
+                    self._latest_status
+                )
+                self._status_dirty = False
+
+        if status is not None:
+            self._apply_status(
+                status
+            )
+
+        speech_busy = self._speech_busy()
+
+        if not speech_busy:
+            with self._lock:
+                if self._events:
+                    event = self._events.popleft()
+
+            if event is not None:
+                self._react_to_event(
+                    event
+                )
+
+        state = self.blackboard.get(
+            BlackboardKey.CHESS_STATE
+        )
+        self.feedback_message = (
+            f"chess overlay: {state}"
+        )
+
+        return py_trees.common.Status.RUNNING

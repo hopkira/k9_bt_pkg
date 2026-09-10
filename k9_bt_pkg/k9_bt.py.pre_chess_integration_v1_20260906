@@ -86,21 +86,6 @@ except ModuleNotFoundError:
     )
 
 
-try:
-    from k9_bt_pkg.chess_behaviours import (
-        BeginChessSetup,
-        ChessRuntimeManager,
-        ContinueChessSetup,
-    )
-except ModuleNotFoundError:
-    from chess_behaviours import (
-        BeginChessSetup,
-        ChessRuntimeManager,
-        ContinueChessSetup,
-    )
-
-
-
 # ---------------------------------------------------------------------------
 # Small blackboard helpers
 # ---------------------------------------------------------------------------
@@ -3231,34 +3216,6 @@ def create_dialogue_manager(
         ]
     )
 
-    # Chess setup is split over separate conversational turns. If the
-    # player is already known from perception, PLAY_CHESS arms immediately.
-    # Otherwise K9 asks the name and returns control so unrelated conversation
-    # remains available while waiting for CHESS_SETUP_ANSWER.
-    play_chess = py_trees.composites.Sequence(
-        name="Play Chess",
-        memory=True,
-    )
-    play_chess.add_children(
-        [
-            IsIntent(Intent.PLAY_CHESS),
-            BeginChessSetup(node=node),
-            ClearConversationTurn(),
-        ]
-    )
-
-    chess_setup_answer = py_trees.composites.Sequence(
-        name="Chess Setup Answer",
-        memory=True,
-    )
-    chess_setup_answer.add_children(
-        [
-            IsIntent(Intent.CHESS_SETUP_ANSWER),
-            ContinueChessSetup(node=node),
-            ClearConversationTurn(),
-        ]
-    )
-
     # Normal conversational turn. The /conversation node has already received
     # the same /intent/result independently and is generating asynchronously.
     # We simply wait for its latched /conversation/response, speak it, then
@@ -3299,8 +3256,6 @@ def create_dialogue_manager(
         [
             stop_conversation,
             face_enrolment,
-            play_chess,
-            chess_setup_answer,
             general_conversation,
             unimplemented_intent,
         ]
@@ -3347,11 +3302,30 @@ def create_dialogue_manager(
     return dialogue_manager
 
 
-def create_chess_manager(
-    node: Node,
-) -> py_trees.behaviour.Behaviour:
-    """Run chess as a non-blocking overlay on normal K9 behaviour."""
-    return ChessRuntimeManager(node)
+def create_chess_manager() -> py_trees.behaviour.Behaviour:
+    chess_setup = sequence("Chess Setup")
+    chess_setup.add_children(
+        [
+            no_work("Ask Player Name"),
+            no_work("Wait For Player Name"),
+            no_work("Ask Preferred Colour"),
+            no_work("Wait For Preferred Colour"),
+            no_work("Start Lichess / Phantom Game"),
+        ]
+    )
+
+    chess_manager = selector("Chess Manager")
+    chess_manager.add_children(
+        [
+            no_work("Suspended Chess Session"),
+            no_work("Active Chess Game"),
+            chess_setup,
+            no_work("Start Chess Setup"),
+            running("Chess Idle"),
+        ]
+    )
+    return chess_manager
+
 
 def create_expression_manager() -> py_trees.behaviour.Behaviour:
     expression_manager = selector("Expression Manager")
@@ -3385,7 +3359,7 @@ def create_tree(node: Node) -> py_trees.behaviour.Behaviour:
             create_perception_state_manager(node),
             create_known_person_greeting_manager(node),
             create_dialogue_manager(node),
-            create_chess_manager(node),
+            create_chess_manager(),
             create_expression_manager(),
         ]
     )
