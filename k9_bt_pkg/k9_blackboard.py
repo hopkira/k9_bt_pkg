@@ -77,6 +77,9 @@ class ChessSetupStep:
     WAIT_COLOUR = "WAIT_COLOUR"
     START_GAME = "START_GAME"
 
+class EmotionalState:
+    NEUTRAL = "NEUTRAL"
+    HAPPY = "HAPPY"
 
 class ExpressionState:
     EMERGENCY = "EMERGENCY"
@@ -184,6 +187,11 @@ class BlackboardKey:
     CHESS_LAST_EVENT = "chess/last_event"
 
     # Physical expression requested by the executive
+    # Emotional state
+    EMOTIONAL_STATE = "emotional/state"
+    EMOTIONAL_EVENT = "emotional/event"
+    EMOTIONAL_EVENT_ID = "emotional/event_id"
+    EMOTIONAL_TRIGGER = "emotional/trigger"
     EXPRESSION_DESIRED = "expression/desired"
     EXPRESSION_EFFECTIVE = "expression/effective"
     EXPRESSION_EYES_LEVEL = "expression/eyes_level"
@@ -660,6 +668,32 @@ K9_BLACKBOARD_FIELDS: tuple[BlackboardField, ...] = (
         str,
         "",
         "Most recent chess event consumed by the executive.",
+    ),
+
+    # Emotional state
+    BlackboardField(
+        BlackboardKey.EMOTIONAL_STATE,
+        str,
+        EmotionalState.NEUTRAL,
+        "K9's current emotional state.",
+    ),
+    BlackboardField(
+        BlackboardKey.EMOTIONAL_EVENT,
+        str,
+        "",
+        "Most recent event affecting K9's emotional state.",
+    ),
+    BlackboardField(
+        BlackboardKey.EMOTIONAL_EVENT_ID,
+        int,
+        0,
+        "Monotonically increasing identifier for emotional events.",
+    ),
+    BlackboardField(
+        BlackboardKey.EMOTIONAL_TRIGGER,
+        str,
+        "",
+        "Human-readable cause of the current emotional state.",
     ),
 
     # Expression
