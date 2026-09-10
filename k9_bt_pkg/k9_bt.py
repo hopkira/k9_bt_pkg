@@ -859,7 +859,7 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
                     face.recognition_confidence
                 ),
                 "relationship": (
-                    face.relationship.strip()
+                    face.relationship.strip().lower()
                     if face.recognised
                     else ""
                 ),
@@ -1043,6 +1043,8 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
                 event,
                 track_id,
                 face["identity"],
+                face["relationship"],
+                face["preferred_address"],
             )
 
             if (
@@ -1399,24 +1401,6 @@ class KnownPersonGreetingManager(py_trees.behaviour.Behaviour):
             BlackboardKey.AUDIO_LAST_EVENT,
             "KNOWN_PERSON_STARTED_CONVERSATION",
             overwrite=True,
-        )
-
-        if is_praise(text):
-            set_emotional_event(
-                self.blackboard,
-                state=EmotionalState.HAPPY,
-                event="PRAISE",
-                trigger=text,
-            )
-
-            self.node.get_logger().info(
-                "Emotional state -> HAPPY: praise detected"
-            )
-
-        self.node.get_logger().info(
-            f"Intent received: {intent} "
-            f"({float(msg.confidence):.2f}) / {text!r} "
-            f"requires_response={bool(msg.requires_response)}"
         )
 
         self._conversation_was_active = True
