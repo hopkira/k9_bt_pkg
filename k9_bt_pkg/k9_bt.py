@@ -1401,6 +1401,24 @@ class KnownPersonGreetingManager(py_trees.behaviour.Behaviour):
             overwrite=True,
         )
 
+        if is_praise(text):
+            set_emotional_event(
+                self.blackboard,
+                state=EmotionalState.HAPPY,
+                event="PRAISE",
+                trigger=text,
+            )
+
+            self.node.get_logger().info(
+                "Emotional state -> HAPPY: praise detected"
+            )
+
+        self.node.get_logger().info(
+            f"Intent received: {intent} "
+            f"({float(msg.confidence):.2f}) / {text!r} "
+            f"requires_response={bool(msg.requires_response)}"
+        )
+
         self._conversation_was_active = True
 
         self.node.get_logger().info(
