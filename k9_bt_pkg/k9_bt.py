@@ -72,6 +72,7 @@ try:
         AudioMode,
         BlackboardKey,
         DialogueState,
+        EmotionalState,
         Intent,
         K9Blackboard,
     )
@@ -81,10 +82,10 @@ except ModuleNotFoundError:
         AudioMode,
         BlackboardKey,
         DialogueState,
+        EmotionalState,
         Intent,
         K9Blackboard,
     )
-
 
 try:
     from k9_bt_pkg.chess_behaviours import (
@@ -105,6 +106,10 @@ except ModuleNotFoundError:
 # Small blackboard helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Small blackboard helpers
+# ---------------------------------------------------------------------------
+
 def register_read_write(
     client: py_trees.blackboard.Client,
     key: str,
@@ -117,6 +122,81 @@ def register_read_write(
     client.register_key(
         key=key,
         access=py_trees.common.Access.WRITE,
+    )
+
+
+def set_emotional_event(
+    blackboard: py_trees.blackboard.Client,
+    *,
+    state: str,
+    event: str,
+    trigger: str,
+) -> None:
+    """Set K9's emotional state and post one consumable emotional event."""
+
+    event_id = int(
+        blackboard.get(
+            BlackboardKey.EMOTIONAL_EVENT_ID
+        )
+    ) + 1
+
+    blackboard.set(
+        BlackboardKey.EMOTIONAL_STATE,
+        state,
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.EMOTIONAL_EVENT,
+        event,
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.EMOTIONAL_TRIGGER,
+        trigger,
+        overwrite=True,
+    )
+    blackboard.set(
+        BlackboardKey.EMOTIONAL_EVENT_ID,
+        event_id,
+        overwrite=True,
+    )
+
+
+PRAISE_PATTERNS = (
+    r"\bgood (?:boy|dog|k9|k nine|kay nine)\b",
+    r"\bclever (?:boy|dog|k9|k nine|kay nine)\b",
+    r"\bwell done(?: k9| k nine| kay nine)?\b",
+    r"\bgreat (?:job|work)(?: k9| k nine| kay nine)?\b",
+    r"\bnice (?:job|work)(?: k9| k nine| kay nine)?\b",
+    r"\bthank you(?: k9| k nine| kay nine)?\b",
+    r"\bthanks(?: k9| k nine| kay nine)?\b",
+    r"\bbrilliant(?: k9| k nine| kay nine)?\b",
+    r"\bexcellent(?: k9| k nine| kay nine)?\b",
+)
+
+
+def is_praise(text: str) -> bool:
+    """Return True for an utterance that praises or thanks K9."""
+
+    normal = text.lower().replace("’", "'")
+    normal = re.sub(
+        r"[^a-z0-9'\s]",
+        " ",
+        normal,
+    )
+    normal = re.sub(
+        r"\s+",
+        " ",
+        normal,
+    ).strip()
+
+    return any(
+        re.search(
+            pattern,
+            normal,
+        )
+        is not None
+        for pattern in PRAISE_PATTERNS
     )
 
 
@@ -261,6 +341,17 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
             BlackboardKey.AUDIO_LAST_EVENT,
         ]:
             register_read_write(self.blackboard, key)
+
+        for key in [
+            BlackboardKey.EMOTIONAL_STATE,
+            BlackboardKey.EMOTIONAL_EVENT,
+            BlackboardKey.EMOTIONAL_EVENT_ID,
+            BlackboardKey.EMOTIONAL_TRIGGER,
+        ]:
+            register_read_write(
+                self.blackboard,
+                key,
+            )
 
         # Dialogue fields populated by IntentResult and conversation responses.
         for key in [
@@ -459,6 +550,18 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
             "INTENT_RECEIVED",
             overwrite=True,
         )
+
+        if is_praise(text):
+            set_emotional_event(
+                self.blackboard,
+                state=EmotionalState.HAPPY,
+                event="PRAISE",
+                trigger=text,
+            )
+
+            self.node.get_logger().info(
+                "Emotional state -> HAPPY: praise detected"
+            )
 
         self.node.get_logger().info(
             f"Intent received: {intent} "
@@ -702,7 +805,12 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
             BlackboardKey.PERCEPTION_EVENT_IDENTITY,
             BlackboardKey.PERCEPTION_EVENT_RELATIONSHIP,
             BlackboardKey.PERCEPTION_EVENT_PREFERRED_ADDRESS,
-            BlackboardKey.PERCEPTION_ERROR,
+            BlackboardKey.PERCEPTION_ERROR,            
+            BlackboardKey.EMOTIONAL_STATE,
+            BlackboardKey.EMOTIONAL_EVENT,
+            BlackboardKey.EMOTIONAL_EVENT_ID,
+            BlackboardKey.EMOTIONAL_TRIGGER,
+
         ]:
             register_read_write(
                 self.blackboard,
@@ -935,9 +1043,24 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
                 event,
                 track_id,
                 face["identity"],
-                face["relationship"],
-                face["preferred_address"],
             )
+
+            if (
+                face["recognised"]
+                and face["relationship"] == "family"
+            ):
+                set_emotional_event(
+                    self.blackboard,
+                    state=EmotionalState.HAPPY,
+                    event="FAMILY_RECOGNISED",
+                    trigger=face["identity"],
+                )
+
+                self.node.get_logger().info(
+                    "Emotional state -> HAPPY: "
+                    f"family member recognised "
+                    f"({face['identity']})"
+                )
 
             event_generated = True
 
@@ -967,6 +1090,23 @@ class ProcessPerceptionEvents(py_trees.behaviour.Behaviour):
                         current["preferred_address"],
                     )
 
+                    if (
+                        current["relationship"]
+                        == "family"
+                    ):
+                        set_emotional_event(
+                            self.blackboard,
+                            state=EmotionalState.HAPPY,
+                            event="FAMILY_RECOGNISED",
+                            trigger=current["identity"],
+                        )
+
+                        self.node.get_logger().info(
+                            "Emotional state -> HAPPY: "
+                            f"family member recognised "
+                            f"({current['identity']})"
+                        )
+        
                     event_generated = True
                     break
 
@@ -3353,19 +3493,155 @@ def create_chess_manager(
     """Run chess as a non-blocking overlay on normal K9 behaviour."""
     return ChessRuntimeManager(node)
 
-def create_expression_manager() -> py_trees.behaviour.Behaviour:
-    expression_manager = selector("Expression Manager")
-    expression_manager.add_children(
-        [
-            inactive("Emergency Expression"),
-            inactive("Talking Eye Animation"),
-            inactive("Listening Expression"),
-            inactive("Waiting Expression"),
-            running("NotListening Expression"),
-        ]
-    )
-    return expression_manager
+class EmotionalExpressionManager(
+    py_trees.behaviour.Behaviour
+):
+    """Turn new emotional events into physical K9 expressions."""
 
+    def __init__(
+        self,
+        node: Node,
+        name: str = "Emotional Expression Manager",
+    ) -> None:
+        super().__init__(name=name)
+
+        self.node = node
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        for key in [
+            BlackboardKey.EMOTIONAL_STATE,
+            BlackboardKey.EMOTIONAL_EVENT,
+            BlackboardKey.EMOTIONAL_EVENT_ID,
+            BlackboardKey.EMOTIONAL_TRIGGER,
+        ]:
+            self.blackboard.register_key(
+                key=key,
+                access=py_trees.common.Access.READ,
+            )
+
+        self.tail_up_client = node.create_client(
+            Trigger,
+            "/tail_up",
+        )
+
+        self.tail_wag_v_client = node.create_client(
+            Trigger,
+            "/tail_wag_v",
+        )
+
+        # Event zero is the initial/default state and must not cause motion.
+        self._handled_event_id = 0
+
+    def _call_tail_service(
+        self,
+        client,
+        service_name: str,
+    ) -> bool:
+        if not client.service_is_ready():
+            self.feedback_message = (
+                f"waiting for {service_name}"
+            )
+            return False
+
+        future = client.call_async(
+            Trigger.Request()
+        )
+
+        future.add_done_callback(
+            lambda completed:
+            self._tail_service_done(
+                completed,
+                service_name,
+            )
+        )
+
+        return True
+
+    def _tail_service_done(
+        self,
+        future,
+        service_name: str,
+    ) -> None:
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.node.get_logger().warning(
+                f"{service_name} failed: {exc}"
+            )
+            return
+
+        if result.success:
+            self.node.get_logger().info(
+                f"Expression completed: {service_name}"
+            )
+        else:
+            self.node.get_logger().warning(
+                result.message
+                or f"{service_name} rejected"
+            )
+
+    def update(self) -> py_trees.common.Status:
+        event_id = int(
+            self.blackboard.get(
+                BlackboardKey.EMOTIONAL_EVENT_ID
+            )
+        )
+
+        if event_id == self._handled_event_id:
+            self.feedback_message = "no new emotional event"
+            return py_trees.common.Status.RUNNING
+
+        event = self.blackboard.get(
+            BlackboardKey.EMOTIONAL_EVENT
+        )
+
+        trigger = self.blackboard.get(
+            BlackboardKey.EMOTIONAL_TRIGGER
+        )
+
+        if event == "FAMILY_RECOGNISED":
+            accepted = self._call_tail_service(
+                self.tail_up_client,
+                "/tail_up",
+            )
+
+        elif event == "PRAISE":
+            accepted = self._call_tail_service(
+                self.tail_wag_v_client,
+                "/tail_wag_v",
+            )
+
+        else:
+            # Unknown emotional events do not block future events.
+            self._handled_event_id = event_id
+            self.feedback_message = (
+                f"no expression for {event}"
+            )
+            return py_trees.common.Status.RUNNING
+
+        # If the Pi service is temporarily unavailable, retain the event and
+        # try it again on the next BT tick.
+        if not accepted:
+            return py_trees.common.Status.RUNNING
+
+        self._handled_event_id = event_id
+
+        self.feedback_message = (
+            f"{event}: {trigger}"
+        )
+
+        return py_trees.common.Status.RUNNING
+
+def create_expression_manager(
+    node: Node,
+) -> py_trees.behaviour.Behaviour:
+    return EmotionalExpressionManager(
+        node
+    )
 
 def create_tree(node: Node) -> py_trees.behaviour.Behaviour:
     """Construct the complete K9 hierarchy."""
@@ -3386,7 +3662,7 @@ def create_tree(node: Node) -> py_trees.behaviour.Behaviour:
             create_known_person_greeting_manager(node),
             create_dialogue_manager(node),
             create_chess_manager(node),
-            create_expression_manager(),
+            create_expression_manager(node),
         ]
     )
 
