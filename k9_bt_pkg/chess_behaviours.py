@@ -6,7 +6,8 @@ separate operating mode.  This module provides:
 
 * BeginChessSetup
     Handles PLAY_CHESS.  It uses an attended/uniquely recognised face when one
-    is available, otherwise asks who K9 is playing.
+    is available, otherwise asks who K9 is playing, then asks the chess
+    manager to initialise the directly connected Phantom board.
 
 * ContinueChessSetup
     Handles a later CHESS_SETUP_ANSWER without monopolising the conversation
@@ -630,7 +631,7 @@ class BeginChessSetup(_ChessDialogueBase):
 
             text = (
                 f"Affirmative, {self.player_name}. "
-                "Please start the game against me in the Phantom application."
+                "I am setting up the chessboard."
             )
             if self._start_speech(text):
                 self.phase = "SPEAK_PHANTOM_PROMPT"
@@ -763,7 +764,7 @@ class ContinueChessSetup(_ChessDialogueBase):
 
             text = (
                 f"Affirmative, {self.player_name}. "
-                "Please start the game against me in the Phantom application."
+                "I am setting up the chessboard."
             )
             if self._start_speech(text):
                 self.phase = "SPEAK_PHANTOM_PROMPT"
@@ -1846,6 +1847,22 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
                     "",
                 ),
                 priority=CHESS_MOVE_SPEECH_PRIORITY,
+            )
+            return
+
+        if event_type == "ILLEGAL_HUMAN_MOVE":
+            self._speak(
+                event.get(
+                    "speech_hint",
+                    "",
+                )
+                or (
+                    "Negative. That move is not legal. "
+                    "I shall restore the board."
+                ),
+                priority=CHESS_MOVE_SPEECH_PRIORITY,
+                owner="chess_illegal_move",
+                interrupt_lower_priority=True,
             )
             return
 
