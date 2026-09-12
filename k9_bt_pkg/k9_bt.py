@@ -71,6 +71,8 @@ try:
     from k9_bt_pkg.k9_blackboard import (
         AudioMode,
         BlackboardKey,
+        ChessSetupStep,
+        ChessState,
         DialogueState,
         EmotionalState,
         Intent,
@@ -81,6 +83,8 @@ except ModuleNotFoundError:
     from k9_blackboard import (
         AudioMode,
         BlackboardKey,
+        ChessSetupStep,
+        ChessState,
         DialogueState,
         EmotionalState,
         Intent,
@@ -1936,11 +1940,11 @@ class WaitForConversationResponse(py_trees.behaviour.Behaviour):
 
 
 class GenerateUnsupportedIntentResponse(py_trees.behaviour.Behaviour):
-    """Provide a temporary safe response for recognised but unimplemented intents.
+    """Provide a safe fallback for recognised but unhandled intents.
 
-    PLAY_CHESS and CHESS_SETUP_ANSWER already exist in the intent schema, but
-    their real dialogue handlers are still placeholders. This leaf prevents an
-    unimplemented intent from leaving the active conversation permanently stuck.
+    PLAY_CHESS and CHESS_SETUP_ANSWER are handled by dedicated chess branches.
+    This leaf is only a final guard so an unexpected executive intent cannot
+    leave the active conversation permanently stuck.
     """
 
     def __init__(
@@ -3123,10 +3127,23 @@ class ClearConversationTurn(py_trees.behaviour.Behaviour):
 
 
 class EndConversation(py_trees.behaviour.Behaviour):
-    """End the conversation only after an explicit STOP_LISTENING intent."""
+    """End the conversation after an explicit STOP_LISTENING intent.
 
-    def __init__(self, name: str = "End Conversation") -> None:
+    In addition to returning audio to WAITING_FOR_HOTWORD, this clears any
+    incomplete chess setup dialogue and removes /intent/context.  Without this
+    cleanup an abandoned "Who am I playing?" prompt can cause utterances in the
+    next conversation to be misclassified as CHESS_SETUP_ANSWER.
+    """
+
+    def __init__(
+        self,
+        *,
+        node: Node,
+        name: str = "End Conversation",
+    ) -> None:
         super().__init__(name=name)
+
+        self.node = node
 
         self.blackboard = self.attach_blackboard_client(
             name=name,
@@ -3145,8 +3162,19 @@ class EndConversation(py_trees.behaviour.Behaviour):
             BlackboardKey.AUDIO_HEARD_TEXT,
             BlackboardKey.AUDIO_DESIRED_MODE,
             BlackboardKey.AUDIO_LAST_EVENT,
+            BlackboardKey.CHESS_STATE,
+            BlackboardKey.CHESS_SETUP_STEP,
         ]:
-            register_read_write(self.blackboard, key)
+            register_read_write(
+                self.blackboard,
+                key,
+            )
+
+        self.intent_context_publisher = node.create_publisher(
+            String,
+            "/intent/context",
+            10,
+        )
 
     def update(self) -> py_trees.common.Status:
         clear_dialogue_turn(self.blackboard)
@@ -3167,7 +3195,40 @@ class EndConversation(py_trees.behaviour.Behaviour):
             overwrite=True,
         )
 
-        self.feedback_message = "STOP_LISTENING; waiting for hotword"
+        # A STOP_LISTENING command abandons any incomplete spoken chess setup.
+        # An already active chess game is left alone; only the SETUP state is
+        # reset.
+        chess_state = str(
+            self.blackboard.get(
+                BlackboardKey.CHESS_STATE
+            )
+            or ""
+        ).upper()
+
+        if chess_state in {
+            "SETUP",
+            "SETTING_UP",
+        }:
+            self.blackboard.set(
+                BlackboardKey.CHESS_SETUP_STEP,
+                ChessSetupStep.NONE,
+                overwrite=True,
+            )
+            self.blackboard.set(
+                BlackboardKey.CHESS_STATE,
+                ChessState.IDLE,
+                overwrite=True,
+            )
+
+        # Clear contextual intent classification regardless of chess state.
+        # This also safely removes stale WAIT_NAME/WAIT_COLOUR context.
+        self.intent_context_publisher.publish(
+            String(data="{}")
+        )
+
+        self.feedback_message = (
+            "STOP_LISTENING; cleared setup context; waiting for hotword"
+        )
         return py_trees.common.Status.SUCCESS
 
 
@@ -3354,7 +3415,7 @@ def create_dialogue_manager(
         [
             IsIntent(Intent.STOP_LISTENING),
             ResetConversationHistory(node=node),
-            EndConversation(),
+            EndConversation(node=node),
         ]
     )
 
@@ -3418,9 +3479,9 @@ def create_dialogue_manager(
         ]
     )
 
-    # PLAY_CHESS and CHESS_SETUP_ANSWER exist already but are not yet connected
-    # to real dialogue behaviours. Do not wait for an LLM response that the
-    # conversation node will never publish for those intents.
+    # Final guard for any recognised executive intent not handled above.
+    # Do not wait for an LLM response that the conversation node will never
+    # publish for those intents.
     unimplemented_intent = py_trees.composites.Sequence(
         name="Unimplemented Intent",
         memory=True,
