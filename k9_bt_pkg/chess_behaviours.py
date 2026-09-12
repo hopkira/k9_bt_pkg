@@ -75,9 +75,14 @@ CHESS_MOVE_SPEECH_PRIORITY = 50
 # "Your move" is useful but deliberately very low priority.
 CHESS_TURN_SPEECH_PRIORITY = 20
 
-# End-of-game speech should normally be heard, while still yielding to higher
-# priority executive dialogue.
+# End-of-game personality speech should normally be heard, while still
+# yielding to higher-priority executive dialogue.
 CHESS_RESULT_SPEECH_PRIORITY = 70
+
+# "Check" and especially "Checkmate" are chess facts, not personality.
+# Give them a slightly higher priority than result commentary so a generated
+# reaction can never obscure the deterministic declaration.
+CHESS_DECLARATION_SPEECH_PRIORITY = 75
 
 CHESS_START_TIMEOUT_SECONDS = 3.0
 
@@ -921,6 +926,11 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
         self._reaction_fallback = ""
         self._reaction_response = None
 
+        # When a game ends by mate, "Checkmate." is spoken deterministically
+        # before any personality reaction.  The LLM may generate in parallel,
+        # but its speech is held until this declaration has completed.
+        self._terminal_declaration_active = False
+
         self.tail_wag_v = node.create_client(
             Trigger,
             "/tail_wag_v",
@@ -1300,6 +1310,58 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
                 Trigger.Request()
             )
 
+    @staticmethod
+    def _with_declaration(
+        text: str,
+        declaration: str,
+    ) -> str:
+        """Append a fixed chess declaration without saying it twice.
+
+        ``move_instruction()`` may evolve independently and could itself start
+        including "check".  Keeping duplicate suppression here makes the BT
+        robust to that change while retaining a deterministic declaration.
+        """
+        base = str(text or "").strip()
+        declaration = str(declaration or "").strip()
+
+        if not declaration:
+            return base
+
+        keyword = declaration.rstrip(".!?").casefold()
+
+        if keyword and keyword in base.casefold():
+            return base
+
+        if not base:
+            return declaration
+
+        if base[-1] not in ".!?":
+            base += "."
+
+        return f"{base} {declaration}"
+
+    @staticmethod
+    def _without_checkmate(text: str) -> str:
+        """Remove an embedded checkmate declaration from a move instruction.
+
+        ``move_instruction()`` currently includes ``Checkmate.`` when a move
+        mates.  The BT deliberately announces checkmate later, only after the
+        Phantom mechanism has completed and GAME_FINISHED confirms the result.
+        Without removing it here the user hears "Checkmate" twice.
+        """
+        value = str(text or "").strip()
+
+        value = re.sub(
+            r"(?i)(?:\s*[,;:-]?\s*)\bcheckmate\b[.!?]*\s*$",
+            "",
+            value,
+        ).strip()
+
+        if value and value[-1] not in ".!?":
+            value += "."
+
+        return value
+
     # ------------------------------------------------------------------
     # English event interpretation / personality reaction
     # ------------------------------------------------------------------
@@ -1511,13 +1573,30 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
                 )
                 + "."
             )
-            instruction = (
-                "Say one short sentence aloud to your opponent reacting to "
-                "your victory. If it was checkmate, mention checkmate. "
-                "Sound pleased and slightly smug in K9's normal character, "
-                "but not rude. Do not analyse the position. Do not describe "
-                "these instructions."
-            )
+
+            if reason == "mate":
+                instruction = (
+                    f"You, K9, won. {player_name} lost. "
+                    "The chess system has already announced 'Checkmate.' "
+                    "Say one short first-person follow-up sentence reacting to "
+                    "YOUR victory. Do not repeat the word checkmate. "
+                    f"Do NOT congratulate {player_name}; {player_name} did not "
+                    "win. Do not say 'Congratulations'. Sound pleased and "
+                    "slightly smug in K9's normal character, but not rude. "
+                    "Do not analyse the position. Do not describe these "
+                    "instructions."
+                )
+            else:
+                instruction = (
+                    f"You, K9, won. {player_name} lost. "
+                    "Say one short first-person sentence reacting to YOUR "
+                    f"victory. Do NOT congratulate {player_name}; "
+                    f"{player_name} did not win. Do not say 'Congratulations'. "
+                    "Sound pleased and slightly smug in K9's normal character, "
+                    "but not rude. Do not analyse the position. Do not describe "
+                    "these instructions."
+                )
+
         elif outcome == "HUMAN_WIN":
             facts.append(
                 f"{player_name} has won the game"
@@ -1528,12 +1607,27 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
                 )
                 + "."
             )
-            instruction = (
-                "Say one short sentence aloud to your opponent acknowledging "
-                "the defeat. Be gracious but recognisably K9: mildly "
-                "disappointed and dignified. Do not analyse the position. "
-                "Do not describe these instructions."
-            )
+
+            if reason == "mate":
+                instruction = (
+                    f"{player_name} won. You, K9, lost. "
+                    "The chess system has already announced 'Checkmate.' "
+                    "Say one short follow-up sentence acknowledging the human's "
+                    "victory. Do not repeat the word checkmate. Be gracious but "
+                    "recognisably K9: mildly disappointed and dignified. "
+                    "Prefer 'Well played' over 'Congratulations'. "
+                    "Do not analyse the position. Do not describe these "
+                    "instructions."
+                )
+            else:
+                instruction = (
+                    f"{player_name} won. You, K9, lost. "
+                    "Say one short sentence acknowledging the human's victory. "
+                    "Be gracious but recognisably K9: mildly disappointed and "
+                    "dignified. Prefer 'Well played' over 'Congratulations'. "
+                    "Do not analyse the position. Do not describe these "
+                    "instructions."
+                )
         else:
             facts.append(
                 "The game has ended in a draw"
@@ -1568,7 +1662,10 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
         ).strip()
 
         if outcome == "K9_WIN":
-            if (
+            if reason == "mate":
+                # "Checkmate." has already been spoken deterministically.
+                fallback = f"A satisfactory result, {player_name}. I have won."
+            elif (
                 terminal_move
                 and terminal_move.get(
                     "type"
@@ -1581,16 +1678,13 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
                     )
                     or ""
                 ).strip()
+
                 if move_hint:
                     fallback = (
                         f"{move_hint} I have won."
                     )
                 else:
-                    fallback = (
-                        "Checkmate. I have won."
-                        if reason == "mate"
-                        else "I have won."
-                    )
+                    fallback = f"A satisfactory result, {player_name}. I have won."
             else:
                 fallback = (
                     base_hint
@@ -1599,7 +1693,7 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
         elif outcome == "HUMAN_WIN":
             fallback = (
                 base_hint
-                or f"Congratulations, {player_name}. You have won."
+                or f"Well played, {player_name}. You have won."
             )
         else:
             fallback = (
@@ -1676,6 +1770,15 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
         if not request_id:
             return
 
+        # A checkmate declaration is a deterministic chess fact and must be
+        # heard before personality commentary.  Ollama is still allowed to
+        # generate the follow-up while "Checkmate." is being spoken.
+        if self._terminal_declaration_active:
+            if self._speech_busy():
+                return
+
+            self._terminal_declaration_active = False
+
         timed_out = (
             requested_at > 0.0
             and (
@@ -1720,6 +1823,7 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
             self._reaction_fallback = ""
             self._reaction_response = None
             self._pending_terminal_move = None
+            self._terminal_declaration_active = False
 
     # ------------------------------------------------------------------
     # Event handling
@@ -1823,31 +1927,79 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
         )
 
         if event_type == "K9_MOVE_SELECTED":
-            if event.get(
-                "gives_mate"
-            ):
-                # Do not speak a separate final-move line. GAME_FINISHED will
-                # combine the move + outcome into one definitive reaction.
+            gives_mate = bool(
+                event.get(
+                    "gives_mate"
+                )
+            )
+            gives_check = bool(
+                event.get(
+                    "gives_check"
+                )
+            )
+
+            if gives_mate:
+                # The move itself may be announced while Phantom executes it,
+                # but "Checkmate." is deliberately deferred until
+                # GAME_FINISHED, after physical completion has been confirmed.
                 self._trigger(
                     self.tail_wag_v
                 )
-                return
 
-            if event.get(
-                "gives_check"
-            ):
+            elif gives_check:
                 self._trigger(
                     self.tail_up
                 )
 
-            # Physical move instructions remain deterministic and precise.
-            self._speak(
+            speech = str(
                 event.get(
                     "speech_hint",
                     "",
-                ),
-                priority=CHESS_MOVE_SPEECH_PRIORITY,
-            )
+                )
+                or ""
+            ).strip()
+
+            if gives_mate:
+                # move_instruction() may already contain "Checkmate.", but
+                # mate is announced exactly once later, after physical
+                # completion has been confirmed by GAME_FINISHED.
+                speech = self._without_checkmate(
+                    speech
+                )
+
+            elif gives_check:
+                speech = self._with_declaration(
+                    speech,
+                    "Check.",
+                )
+
+            # Physical move instructions remain deterministic and precise.
+            if speech:
+                self._speak(
+                    speech,
+                    priority=CHESS_MOVE_SPEECH_PRIORITY,
+                )
+
+            return
+
+        if event_type == "HUMAN_MOVE":
+            # A human check is also a chess fact worth stating explicitly.
+            # Checkmate itself is announced by GAME_FINISHED so it is spoken
+            # exactly once, irrespective of who delivered mate.
+            if (
+                event.get(
+                    "gives_check"
+                )
+                and not event.get(
+                    "gives_mate"
+                )
+            ):
+                self._speak(
+                    "Check.",
+                    priority=CHESS_DECLARATION_SPEECH_PRIORITY,
+                    owner="chess_check",
+                )
+
             return
 
         if event_type == "ILLEGAL_HUMAN_MOVE":
@@ -1872,7 +2024,7 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
                     "speech_hint",
                     "",
                 )
-                or "Your move.",
+                or "Your turn to move.",
                 priority=CHESS_TURN_SPEECH_PRIORITY,
             )
             return
@@ -1883,6 +2035,39 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
                     event
                 )
             )
+
+            reason = (
+                result.split(
+                    ":",
+                    1,
+                )[1].lower()
+                if ":" in result
+                else str(
+                    event.get(
+                        "status",
+                        "",
+                    )
+                    or ""
+                ).lower()
+            )
+
+            is_checkmate = (
+                reason == "mate"
+            )
+
+            if is_checkmate:
+                # Deterministic and higher priority than personality speech.
+                # This can interrupt stale move commentary but still yields to
+                # normal priority-100 dialogue.
+                self._terminal_declaration_active = (
+                    self._speak(
+                        "Checkmate.",
+                        priority=CHESS_DECLARATION_SPEECH_PRIORITY,
+                        owner="chess_checkmate",
+                        interrupt_lower_priority=True,
+                        clear_lower_priority=True,
+                    )
+                )
 
             if outcome == "K9_WIN":
                 self._trigger(
