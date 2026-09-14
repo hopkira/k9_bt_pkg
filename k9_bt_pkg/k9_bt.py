@@ -111,12 +111,6 @@ except ModuleNotFoundError:
         ContinueChessSetup,
     )
 
-
-
-# ---------------------------------------------------------------------------
-# Small blackboard helpers
-# ---------------------------------------------------------------------------
-
 # ---------------------------------------------------------------------------
 # Small blackboard helpers
 # ---------------------------------------------------------------------------
@@ -2380,7 +2374,6 @@ class ResetConversationHistory(py_trees.behaviour.Behaviour):
     def initialise(self) -> None:
         self.future = None
         self.warned_unavailable = False
-        self.started_at = time.monotonic()
 
     def update(self) -> py_trees.common.Status:
         if self.future is None:
