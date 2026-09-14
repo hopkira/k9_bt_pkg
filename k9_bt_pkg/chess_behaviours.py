@@ -915,6 +915,9 @@ class ChessControlCommand(py_trees.behaviour.Behaviour):
 
         try:
             response = self.future.result()
+            self.node.get_logger().info(
+                f"Chess command {self.command}: {response.message}"
+            )
             self.feedback_message = str(
                 response.message
             )
