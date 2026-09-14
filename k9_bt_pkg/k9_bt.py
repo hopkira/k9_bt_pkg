@@ -34,8 +34,9 @@ remains a physical control surface rather than a parallel audio controller.
 
 Raw STT text is retained for diagnostics only. Dialogue sequencing waits for
 /intent/result so STOP_LISTENING cannot race the normal conversation path.
-The separate /conversation node subscribes to the same IntentResult and
-publishes generated text on /conversation/response.
+For GENERAL_CONVERSATION, the behaviour tree publishes an authorised request
+on /conversation/request and then waits for generated text on
+/conversation/response.
 """
 
 from __future__ import annotations
@@ -62,7 +63,10 @@ from rclpy.qos import (
 )
 
 from k9_interfaces_pkg.action import CaptureFace, SpeakText
-from k9_interfaces_pkg.srv import CommitFaceEnrollment
+from k9_interfaces_pkg.srv import (
+    CommitFaceEnrollment,
+    RetrieveKnowledge,
+)
 from k9_interfaces_pkg.msg import (
     IntentResult,
     RecognisedFaceArray,
@@ -582,7 +586,7 @@ class ProcessAudioEvents(py_trees.behaviour.Behaviour):
         ):
             self.node.get_logger().warning(
                 "GENERAL_CONVERSATION was marked requires_response=false; "
-                "the conversation node will not produce a reply"
+                "treating it as requiring a response"
             )
 
     def _conversation_response_callback(self, msg: String) -> None:
@@ -1890,6 +1894,284 @@ class IsIntent(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.FAILURE
 
 
+class RetrieveKnowledgeAndRequestConversation(
+    py_trees.behaviour.Behaviour
+):
+    """
+    Retrieve one relevant long-term memory, then ask the conversation
+    node to generate K9's reply.
+
+    RAG is optional. If the service is unavailable, fails, times out,
+    or returns no document, normal conversation still proceeds.
+    """
+
+    def __init__(
+        self,
+        node: Node,
+        name: str = "Retrieve Knowledge",
+    ) -> None:
+
+        super().__init__(
+            name=name
+        )
+
+        self.node = node
+
+        self.blackboard = self.attach_blackboard_client(
+            name=name,
+            namespace="k9",
+        )
+
+        self.blackboard.register_key(
+            key=BlackboardKey.DIALOGUE_COMMAND,
+            access=py_trees.common.Access.READ,
+        )
+
+        self.rag_client = node.create_client(
+            RetrieveKnowledge,
+            "/k9/rag/retrieve",
+        )
+
+        self.conversation_request_pub = (
+            node.create_publisher(
+                String,
+                "/conversation/request",
+                10,
+            )
+        )
+
+        self.future = None
+        self.query = ""
+        self.started_at = 0.0
+        self.dispatched = False
+
+        # Loading the 4B embedding model can take several seconds
+        # because it is deliberately unloaded after each query.
+        self.timeout_seconds = 20.0
+
+    def initialise(self) -> None:
+
+        self.future = None
+
+        self.query = (
+            self.blackboard.get(
+                BlackboardKey.DIALOGUE_COMMAND
+            )
+            or ""
+        ).strip()
+
+        self.started_at = time.monotonic()
+        self.dispatched = False
+
+    def _dispatch(
+        self,
+        rag_context: str = "",
+        rag_source: str = "",
+        rag_score: float = 0.0,
+        rag_metadata: str = "",
+    ) -> None:
+
+        payload = {
+            "text": self.query,
+            "rag_context": rag_context,
+            "rag_source": rag_source,
+            "rag_score": rag_score,
+            "rag_metadata": rag_metadata,
+        }
+
+        message = String()
+
+        message.data = json.dumps(
+            payload,
+            separators=(",", ":"),
+        )
+
+        self.conversation_request_pub.publish(
+            message
+        )
+
+        self.dispatched = True
+
+    def update(
+        self,
+    ) -> py_trees.common.Status:
+
+        if not self.query:
+
+            self.feedback_message = (
+                "no conversation text"
+            )
+
+            return py_trees.common.Status.FAILURE
+
+        if self.dispatched:
+
+            return py_trees.common.Status.SUCCESS
+
+        # Start the asynchronous RAG request.
+        if self.future is None:
+
+            if not self.rag_client.service_is_ready():
+
+                self.node.get_logger().warning(
+                    "RAG service unavailable; "
+                    "continuing without long-term memory"
+                )
+
+                self._dispatch()
+
+                return py_trees.common.Status.SUCCESS
+
+            request = RetrieveKnowledge.Request()
+
+            request.query = self.query
+
+            # Chroma top 5 -> reranker -> top 1.
+            request.max_results = 5
+
+            self.future = (
+                self.rag_client.call_async(
+                    request
+                )
+            )
+
+            self.feedback_message = (
+                "retrieving long-term memory"
+            )
+
+            return py_trees.common.Status.RUNNING
+
+        # Wait non-blockingly for the RAG service.
+        if not self.future.done():
+
+            elapsed = (
+                time.monotonic()
+                - self.started_at
+            )
+
+            if elapsed < self.timeout_seconds:
+
+                self.feedback_message = (
+                    "waiting for long-term memory"
+                )
+
+                return py_trees.common.Status.RUNNING
+
+            self.node.get_logger().warning(
+                "RAG lookup timed out; "
+                "continuing without long-term memory"
+            )
+
+            self._dispatch()
+
+            return py_trees.common.Status.SUCCESS
+
+        try:
+
+            result = self.future.result()
+
+        except Exception as exc:
+
+            self.node.get_logger().warning(
+                f"RAG lookup failed: {exc}; "
+                "continuing without long-term memory"
+            )
+
+            self._dispatch()
+
+            return py_trees.common.Status.SUCCESS
+
+        if (
+            result is None
+            or not result.success
+        ):
+
+            error = (
+                result.error
+                if result is not None
+                else "no result"
+            )
+
+            self.node.get_logger().warning(
+                f"RAG lookup failed: {error}; "
+                "continuing without long-term memory"
+            )
+
+            self._dispatch()
+
+            return py_trees.common.Status.SUCCESS
+
+        # No sufficiently relevant memory.
+        if not result.documents:
+
+            self.node.get_logger().info(
+                "RAG: no relevant long-term memory "
+                f"for {self.query!r}"
+            )
+
+            self._dispatch()
+
+            return py_trees.common.Status.SUCCESS
+
+        # k9_rag deliberately returns no more than one
+        # reranked document.
+        document = result.documents[0]
+
+        source = (
+            result.sources[0]
+            if result.sources
+            else ""
+        )
+
+        score = (
+            float(result.scores[0])
+            if result.scores
+            else 0.0
+        )
+
+        metadata = (
+            result.metadata_json[0]
+            if result.metadata_json
+            else ""
+        )
+
+        self.node.get_logger().info(
+            "RAG memory selected: "
+            f"source={source or 'unknown'}, "
+            f"score={score:.3f}"
+        )
+
+        self._dispatch(
+            rag_context=document,
+            rag_source=source,
+            rag_score=score,
+            rag_metadata=metadata,
+        )
+
+        self.feedback_message = (
+            "conversation request dispatched "
+            "with long-term memory"
+        )
+
+        return py_trees.common.Status.SUCCESS
+
+    def terminate(
+        self,
+        new_status: py_trees.common.Status,
+    ) -> None:
+
+        if (
+            new_status
+            == py_trees.common.Status.INVALID
+            and self.future is not None
+            and not self.future.done()
+        ):
+
+            try:
+                self.future.cancel()
+            except Exception:
+                pass
+
 class WaitForConversationResponse(py_trees.behaviour.Behaviour):
     """Wait for /conversation to populate the pending LLM response."""
 
@@ -2096,6 +2378,8 @@ class ResetConversationHistory(py_trees.behaviour.Behaviour):
         self.warned_unavailable = False
 
     def initialise(self) -> None:
+        self.future = None
+        self.warned_unavailable = False
         self.started_at = time.monotonic()
 
     def update(self) -> py_trees.common.Status:
@@ -3575,10 +3859,10 @@ def create_dialogue_manager(
         ]
     )
 
-    # Normal conversational turn. The /conversation node has already received
-    # the same /intent/result independently and is generating asynchronously.
-    # We simply wait for its latched /conversation/response, speak it, then
-    # clear the turn while leaving the conversation active.
+    # Normal conversational turn. The intent result is owned by the BT.
+    # Retrieve optional long-term memory first, then submit one authorised
+    # request to the conversation node. RAG failure is deliberately non-fatal:
+    # normal conversation proceeds without memory if retrieval is unavailable.
     general_conversation = py_trees.composites.Sequence(
         name="General Conversation",
         memory=True,
@@ -3586,6 +3870,9 @@ def create_dialogue_manager(
     general_conversation.add_children(
         [
             IsIntent(Intent.GENERAL_CONVERSATION),
+            RetrieveKnowledgeAndRequestConversation(
+                node=node
+            ),
             WaitForConversationResponse(),
             SpeakPendingResponse(node=node),
             ClearConversationTurn(),
