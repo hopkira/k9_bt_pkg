@@ -1893,69 +1893,6 @@ class IsIntent(py_trees.behaviour.Behaviour):
 
         return py_trees.common.Status.FAILURE
 
-class SendConversationRequest(
-    py_trees.behaviour.Behaviour
-):
-    """Send the current general-conversation turn for generation."""
-
-    def __init__(
-        self,
-        node: Node,
-        name: str = "Send Conversation Request",
-    ) -> None:
-        super().__init__(name=name)
-
-        self.node = node
-
-        self.blackboard = self.attach_blackboard_client(
-            name=name,
-            namespace="k9",
-        )
-
-        self.blackboard.register_key(
-            key=BlackboardKey.DIALOGUE_COMMAND,
-            access=py_trees.common.Access.READ,
-        )
-
-        self.publisher = node.create_publisher(
-            String,
-            "/conversation/request",
-            10,
-        )
-
-    def update(self) -> py_trees.common.Status:
-        text = self.blackboard.get(
-            BlackboardKey.DIALOGUE_COMMAND
-        ).strip()
-
-        if not text:
-            self.feedback_message = (
-                "no conversation text"
-            )
-            return py_trees.common.Status.FAILURE
-
-        payload = {
-            "text": text,
-            "rag_context": "",
-            "rag_source": "",
-            "rag_score": 0.0,
-        }
-
-        self.publisher.publish(
-            String(
-                data=json.dumps(
-                    payload,
-                    separators=(",", ":"),
-                )
-            )
-        )
-
-        self.feedback_message = (
-            f"conversation request sent: {text!r}"
-        )
-
-        return py_trees.common.Status.SUCCESS
-
 
 class RetrieveKnowledgeAndRequestConversation(
     py_trees.behaviour.Behaviour
@@ -3936,7 +3873,6 @@ def create_dialogue_manager(
             RetrieveKnowledgeAndRequestConversation(
                 node=node
             ),
-            SendConversationRequest(node=node),
             WaitForConversationResponse(),
             SpeakPendingResponse(node=node),
             ClearConversationTurn(),
