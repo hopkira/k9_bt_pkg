@@ -541,6 +541,14 @@ class BeginChessSetup(_ChessDialogueBase):
                 or ""
             ).upper()
 
+            if current_state == "FINISHED":
+                if self._start_speech(
+                    "I am resetting the board from the previous game. "
+                    "Please try again when it is ready."
+                ):
+                    self.phase = "SPEAK_RESETTING"
+                return py_trees.common.Status.RUNNING
+
             if current_state in {
                 "WAITING_FOR_CHALLENGE",
                 "ACTIVE",
@@ -644,6 +652,7 @@ class BeginChessSetup(_ChessDialogueBase):
 
         if self.phase in {
             "SPEAK_ALREADY_ACTIVE",
+            "SPEAK_RESETTING",
             "SPEAK_START_FAILED",
             "SPEAK_PHANTOM_PROMPT",
         }:
@@ -824,10 +833,14 @@ class ChessControlCommand(py_trees.behaviour.Behaviour):
         )
         self.future = None
         self.started_at = 0.0
+        self.request_sent_at = 0.0
+        self.attempts = 0
 
     def initialise(self) -> None:
         self.future = None
         self.started_at = time.monotonic()
+        self.request_sent_at = 0.0
+        self.attempts = 0
 
     def update(self) -> py_trees.common.Status:
         if self.future is None:
@@ -846,10 +859,58 @@ class ChessControlCommand(py_trees.behaviour.Behaviour):
             self.future = self.client.call_async(
                 request
             )
+            self.request_sent_at = time.monotonic()
+            self.attempts += 1
             self.feedback_message = self.command
             return py_trees.common.Status.RUNNING
 
         if not self.future.done():
+            elapsed = (
+                time.monotonic()
+                - self.request_sent_at
+            )
+
+            if elapsed >= 3.0:
+                retryable_commands = {
+                    "HUMAN_RESIGN",
+                    "RESIGN",
+                    "ABORT",
+                    "SUSPEND",
+                    "RESUME",
+                    "RESET",
+                }
+
+                if (
+                    self.command in retryable_commands
+                    and self.attempts < 2
+                ):
+                    self.node.get_logger().warning(
+                        f"Chess command {self.command} "
+                        "timed out; retrying once"
+                    )
+
+                    try:
+                        self.future.cancel()
+                    except Exception:
+                        pass
+
+                    self.future = None
+                    self.started_at = time.monotonic()
+                    self.request_sent_at = 0.0
+
+                    return py_trees.common.Status.RUNNING
+
+                self.node.get_logger().error(
+                    f"Chess command {self.command} "
+                    "timed out waiting for /chess/control"
+                )
+
+                self.feedback_message = (
+                    f"{self.command} timed out"
+                )
+
+                return py_trees.common.Status.SUCCESS
+
             return py_trees.common.Status.RUNNING
 
         try:
