@@ -1900,8 +1900,12 @@ class WaitForConversationResponse(py_trees.behaviour.Behaviour):
     ) -> None:
         super().__init__(name=name)
 
-        self.timeout_seconds = timeout_seconds
-        self.started_at = 0.0
+        self.timeout_seconds = float(
+            timeout_seconds
+        )
+
+        # None means that this particular wait has not started yet.
+        self.started_at = None
 
         self.blackboard = self.attach_blackboard_client(
             name=name,
@@ -1928,58 +1932,93 @@ class WaitForConversationResponse(py_trees.behaviour.Behaviour):
             BlackboardKey.DIALOGUE_STATE,
         )
 
+    def initialise(self) -> None:
+        # Start a fresh timer every time this behaviour is entered.
+        self.started_at = None
+
     def update(self) -> py_trees.common.Status:
         if not self.blackboard.get(
             BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE
         ):
-            self.feedback_message = "conversation no longer active"
+            self.feedback_message = (
+                "conversation no longer active"
+            )
             return py_trees.common.Status.FAILURE
 
         intent = self.blackboard.get(
             BlackboardKey.DIALOGUE_INTENT
         )
+
         if intent != Intent.GENERAL_CONVERSATION:
-            self.feedback_message = f"not a general conversation turn: {intent}"
+            self.feedback_message = (
+                f"not a general conversation turn: {intent}"
+            )
             return py_trees.common.Status.FAILURE
 
         response = self.blackboard.get(
             BlackboardKey.DIALOGUE_PENDING_RESPONSE
         ).strip()
 
-        if not response:
-            elapsed = time.monotonic() - self.started_at
+        # A response may already have arrived between BT ticks.
+        if response:
+            self.started_at = None
+            self.feedback_message = response
+            return py_trees.common.Status.SUCCESS
 
-            if elapsed >= self.timeout_seconds:
-                response = (
-                    "Apologies. My response generator did not answer."
-                )
-
-                self.blackboard.set(
-                    BlackboardKey.DIALOGUE_PENDING_RESPONSE,
-                    response,
-                    overwrite=True,
-                )
-
-                self.blackboard.set(
-                    BlackboardKey.DIALOGUE_STATE,
-                    DialogueState.WAITING_TO_SPEAK,
-                    overwrite=True,
-                )
-
-                self.feedback_message = (
-                    "conversation response timed out"
-                )
-
-                return py_trees.common.Status.SUCCESS
+        # Start timing only when we genuinely begin waiting.
+        if self.started_at is None:
+            self.started_at = time.monotonic()
 
             self.feedback_message = (
                 "waiting for /conversation/response"
             )
+
             return py_trees.common.Status.RUNNING
 
-        self.feedback_message = response
+        elapsed = (
+            time.monotonic()
+            - self.started_at
+        )
+
+        if elapsed < self.timeout_seconds:
+            self.feedback_message = (
+                "waiting for /conversation/response "
+                f"({elapsed:.1f}s)"
+            )
+
+            return py_trees.common.Status.RUNNING
+
+        fallback = (
+            "Apologies. My response generator did not answer."
+        )
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+            fallback,
+            overwrite=True,
+        )
+
+        self.blackboard.set(
+            BlackboardKey.DIALOGUE_STATE,
+            DialogueState.WAITING_TO_SPEAK,
+            overwrite=True,
+        )
+
+        self.feedback_message = (
+            f"conversation response timed out "
+            f"after {elapsed:.1f}s"
+        )
+
+        self.started_at = None
+
         return py_trees.common.Status.SUCCESS
 
+    def terminate(
+        self,
+        new_status: py_trees.common.Status,
+    ) -> None:
+        if new_status != py_trees.common.Status.RUNNING:
+            self.started_at = None
 
 class GenerateUnsupportedIntentResponse(py_trees.behaviour.Behaviour):
     """Provide a safe fallback for recognised but unhandled intents.
