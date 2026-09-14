@@ -46,7 +46,7 @@ from std_srvs.srv import Trigger
 
 from k9_interfaces_pkg.action import SpeakText
 from k9_interfaces_pkg.msg import ChessEvent, ChessStatus
-from k9_interfaces_pkg.srv import StartChessGame
+from k9_interfaces_pkg.srv import ControlChessGame, StartChessGame
 
 try:
     from k9_bt_pkg.k9_blackboard import (
@@ -803,6 +803,68 @@ class ContinueChessSetup(_ChessDialogueBase):
 
         self.feedback_message = f"unexpected phase {self.phase}"
         return py_trees.common.Status.FAILURE
+
+
+class ChessControlCommand(py_trees.behaviour.Behaviour):
+    """Send one non-blocking executive chess command to the chess manager."""
+
+    def __init__(
+        self,
+        *,
+        node: Node,
+        command: str,
+        name: str,
+    ) -> None:
+        super().__init__(name=name)
+        self.node = node
+        self.command = str(command).strip().upper()
+        self.client = node.create_client(
+            ControlChessGame,
+            "/chess/control",
+        )
+        self.future = None
+        self.started_at = 0.0
+
+    def initialise(self) -> None:
+        self.future = None
+        self.started_at = time.monotonic()
+
+    def update(self) -> py_trees.common.Status:
+        if self.future is None:
+            if not self.client.service_is_ready():
+                if time.monotonic() - self.started_at >= 3.0:
+                    self.node.get_logger().error(
+                        "/chess/control is unavailable"
+                    )
+                    return py_trees.common.Status.SUCCESS
+
+                self.feedback_message = "waiting for /chess/control"
+                return py_trees.common.Status.RUNNING
+
+            request = ControlChessGame.Request()
+            request.command = self.command
+            self.future = self.client.call_async(
+                request
+            )
+            self.feedback_message = self.command
+            return py_trees.common.Status.RUNNING
+
+        if not self.future.done():
+            return py_trees.common.Status.RUNNING
+
+        try:
+            response = self.future.result()
+            self.feedback_message = str(
+                response.message
+            )
+        except Exception as exc:
+            self.node.get_logger().error(
+                f"Chess command {self.command} failed: {exc}"
+            )
+
+        # Command rejection/decision speech is published as chess events by
+        # the authoritative manager, so the dialogue turn can always clear.
+        return py_trees.common.Status.SUCCESS
 
 
 class ChessRuntimeManager(py_trees.behaviour.Behaviour):
@@ -2026,6 +2088,27 @@ class ChessRuntimeManager(py_trees.behaviour.Behaviour):
                 )
                 or "Your turn to move.",
                 priority=CHESS_TURN_SPEECH_PRIORITY,
+            )
+            return
+
+        if event_type in {
+            "DRAW_OFFER_DECLINED",
+            "CHESS_COMMAND_REJECTED",
+        }:
+            self._speak(
+                str(
+                    event.get(
+                        "speech_hint",
+                        "",
+                    )
+                    or event.get(
+                        "message",
+                        "",
+                    )
+                ),
+                priority=CHESS_RESULT_SPEECH_PRIORITY,
+                owner="chess_decision",
+                interrupt_lower_priority=True,
             )
             return
 
