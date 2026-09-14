@@ -48,6 +48,7 @@ import threading
 import py_trees
 import py_trees_ros
 import rclpy
+import time
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -1895,24 +1896,36 @@ class WaitForConversationResponse(py_trees.behaviour.Behaviour):
     def __init__(
         self,
         name: str = "Wait For Conversation Response",
+        timeout_seconds: float = 35.0,
     ) -> None:
         super().__init__(name=name)
+
+        self.timeout_seconds = timeout_seconds
+        self.started_at = 0.0
 
         self.blackboard = self.attach_blackboard_client(
             name=name,
             namespace="k9",
         )
-        self.blackboard.register_key(
-            key=BlackboardKey.DIALOGUE_PENDING_RESPONSE,
-            access=py_trees.common.Access.READ,
+
+        register_read_write(
+            self.blackboard,
+            BlackboardKey.DIALOGUE_PENDING_RESPONSE,
         )
+
         self.blackboard.register_key(
             key=BlackboardKey.DIALOGUE_INTENT,
             access=py_trees.common.Access.READ,
         )
+
         self.blackboard.register_key(
             key=BlackboardKey.DIALOGUE_CONVERSATION_ACTIVE,
             access=py_trees.common.Access.READ,
+        )
+
+        register_read_write(
+            self.blackboard,
+            BlackboardKey.DIALOGUE_STATE,
         )
 
     def update(self) -> py_trees.common.Status:
@@ -1934,7 +1947,34 @@ class WaitForConversationResponse(py_trees.behaviour.Behaviour):
         ).strip()
 
         if not response:
-            self.feedback_message = "waiting for /conversation/response"
+            elapsed = time.monotonic() - self.started_at
+
+            if elapsed >= self.timeout_seconds:
+                response = (
+                    "Apologies. My response generator did not answer."
+                )
+
+                self.blackboard.set(
+                    BlackboardKey.DIALOGUE_PENDING_RESPONSE,
+                    response,
+                    overwrite=True,
+                )
+
+                self.blackboard.set(
+                    BlackboardKey.DIALOGUE_STATE,
+                    DialogueState.WAITING_TO_SPEAK,
+                    overwrite=True,
+                )
+
+                self.feedback_message = (
+                    "conversation response timed out"
+                )
+
+                return py_trees.common.Status.SUCCESS
+
+            self.feedback_message = (
+                "waiting for /conversation/response"
+            )
             return py_trees.common.Status.RUNNING
 
         self.feedback_message = response
@@ -2017,7 +2057,7 @@ class ResetConversationHistory(py_trees.behaviour.Behaviour):
         self.warned_unavailable = False
 
     def initialise(self) -> None:
-        self.future = None
+        self.started_at = time.monotonic()
 
     def update(self) -> py_trees.common.Status:
         if self.future is None:
